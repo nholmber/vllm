@@ -500,6 +500,43 @@ class DefaultMoERunner(MoERunner):
                 router_logits=router_logits,
             )
 
+            # For FSE (Fused Shared Experts): inject shared expert
+            # gate weights into the topk buffer when using routers
+            # that don't already handle it (e.g. FusedTopKRouter).
+            # GroupedTopKRouter handles this inside
+            # rocm_aiter_grouped_topk.
+            num_fused_shared = getattr(layer, "num_fused_shared_experts", 0)
+            if num_fused_shared > 0:
+                from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
+                    inject_shared_expert_weights,
+                )
+
+                shared_expert_gate = getattr(layer, "_shared_expert_gate", None)
+                if shared_expert_gate is not None:
+                    gate_logits, _ = shared_expert_gate(hidden_states)
+                    top_k = getattr(layer, "top_k", topk_weights.shape[1])
+                    if topk_weights.shape[1] > top_k:
+                        # Router already returned the combined buffer
+                        torch.sigmoid(
+                            gate_logits,
+                            out=topk_weights[
+                                :, top_k : top_k + num_fused_shared
+                            ],
+                        )
+                        shared_expert_weights = None
+                    else:
+                        shared_expert_weights = torch.sigmoid(gate_logits)
+                else:
+                    shared_expert_weights = None
+
+                topk_weights, topk_ids = inject_shared_expert_weights(
+                    topk_weights,
+                    topk_ids,
+                    topk=getattr(layer, "top_k", topk_weights.shape[1]),
+                    num_fused_shared_experts=num_fused_shared,
+                    shared_expert_weights=shared_expert_weights,
+                )
+
             result = self.quant_method.apply(
                 layer=layer,
                 x=hidden_states,
