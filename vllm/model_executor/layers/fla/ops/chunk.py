@@ -30,6 +30,7 @@ def chunk_gated_delta_rule_fwd(
     initial_state: torch.Tensor,
     output_final_state: bool,
     cu_seqlens: torch.Tensor | None = None,
+    core_attn_out: torch.Tensor | None = None,
 ):
     g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
     # obtain WY representation. u is actually the new v.
@@ -62,6 +63,7 @@ def chunk_gated_delta_rule_fwd(
         g=g,
         scale=scale,
         cu_seqlens=cu_seqlens,
+        core_attn_out=core_attn_out,
     )
     if SUPPRESS_LEVEL < 3:
         return g, o, A, final_state, None, None, None
@@ -85,6 +87,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         output_final_state: bool,
         cu_seqlens: torch.Tensor | None = None,
         use_qk_l2norm_in_kernel: bool = False,
+        core_attn_out: torch.Tensor | None = None,
     ):
         if use_qk_l2norm_in_kernel:
             q = l2norm_fwd(q)
@@ -100,9 +103,12 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             initial_state=initial_state,
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
+            core_attn_out=core_attn_out,
         )
         ctx.scale = scale
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
+        if core_attn_out is not None:
+            assert q.dtype == o.dtype, "Incompatible dtype for inplace computation"
         return o.to(q.dtype), final_state
 
 
@@ -118,6 +124,7 @@ def chunk_gated_delta_rule(
     output_final_state: bool = False,
     cu_seqlens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
+    core_attn_out: torch.Tensor | None = None,
 ):
     r"""
     Args:
@@ -207,5 +214,6 @@ def chunk_gated_delta_rule(
         output_final_state,
         cu_seqlens,
         use_qk_l2norm_in_kernel,
+        core_attn_out,
     )
     return o, final_state

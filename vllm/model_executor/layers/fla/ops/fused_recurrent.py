@@ -188,6 +188,7 @@ def fused_recurrent_gated_delta_rule_fwd(
     ssm_state_indices: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
+    core_attn_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
@@ -198,7 +199,7 @@ def fused_recurrent_gated_delta_rule_fwd(
     num_stages = 3
     num_warps = 1
 
-    o = q.new_empty(NK, *v.shape)
+    o = core_attn_out[:NK*v.numel()].view(NK, *v.shape) if core_attn_out is not None else q.new_empty(NK, *v.shape)
     if inplace_final_state:
         final_state = initial_state
     else:
@@ -493,6 +494,7 @@ class FusedRecurrentFunction(torch.autograd.Function):
         ssm_state_indices: torch.Tensor | None = None,
         num_accepted_tokens: torch.Tensor | None = None,
         use_qk_l2norm_in_kernel: bool = False,
+        core_attn_out: torch.Tensor | None = None,
     ):
         o, final_state = fused_recurrent_gated_delta_rule_fwd(
             q=q.contiguous(),
@@ -507,6 +509,7 @@ class FusedRecurrentFunction(torch.autograd.Function):
             ssm_state_indices=ssm_state_indices,
             num_accepted_tokens=num_accepted_tokens,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            core_attn_out=core_attn_out,
         )
 
         return o, final_state
@@ -525,6 +528,7 @@ def fused_recurrent_gated_delta_rule(
     ssm_state_indices: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
+    core_attn_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     r"""
     Args:
@@ -614,5 +618,6 @@ def fused_recurrent_gated_delta_rule(
         ssm_state_indices,
         num_accepted_tokens,
         use_qk_l2norm_in_kernel,
+        core_attn_out,
     )
     return o, final_state
