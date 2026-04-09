@@ -684,17 +684,29 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         # ============================================================
         # Part 3: Output Projection
         # ============================================================
-        rms_norm_parameters = {
-            "z": z,
-            "weight": self.norm.weight,
-            "bias": self.norm.bias,
-            "group_size": self.norm.group_size,
-            "eps": self.norm.eps,
-            "norm_before_gate": self.norm.norm_before_gate,
-            "activation": self.norm.activation,
-        }
-        core_attn_out = core_attn_out.view(num_tokens, -1)
-        output[:num_tokens], _ = self.out_proj(core_attn_out, rms_norm_parameters)
+
+        quant_method = self.out_proj.quant_method.__class__.__name__
+        if quant_method == "Fp8LinearMethod":
+            rms_norm_parameters = {
+                "z": z,
+                "weight": self.norm.weight,
+                "bias": self.norm.bias,
+                "group_size": self.norm.group_size,
+                "eps": self.norm.eps,
+                "norm_before_gate": self.norm.norm_before_gate,
+                "activation": self.norm.activation,
+            }
+            core_attn_out = core_attn_out.view(num_tokens, -1)
+            output[:num_tokens], _ = self.out_proj(core_attn_out, rms_norm_parameters)
+        else:
+            z_shape_og = z.shape
+            # Reshape input data into 2D tensor
+            core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
+            z = z.reshape(-1, z.shape[-1])
+            core_attn_out = self.norm(core_attn_out, z)
+            core_attn_out = core_attn_out.reshape(z_shape_og)
+            core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
+            output[:num_tokens], _ = self.out_proj(core_attn_out)
 
     def _warmup_prefill_kernels(self, mixed_qkv: torch.Tensor) -> None:
         """Warm up GDN prefill kernels during V1 profiling.

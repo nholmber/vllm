@@ -107,8 +107,14 @@ class Qwen2MoeMLP(nn.Module):
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
-        out = self.act_fn(gate_up)
-        out, _ = self.down_proj(out)
+
+        quant_method = self.down_proj.quant_method.__class__.__name__
+        if quant_method == "Fp8LinearMethod":
+            ## fuse silu_and_mul + input fp8 quant
+            out, _ = self.down_proj(gate_up, silu_mul=True)
+        else:
+            out = self.act_fn(gate_up)
+            out, _ = self.down_proj(out)
 
         if self.expert_gate is not None:
             out = F.sigmoid(self.expert_gate(x)[0]) * out

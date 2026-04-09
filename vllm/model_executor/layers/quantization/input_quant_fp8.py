@@ -35,6 +35,63 @@ def calc_rows_per_block(M: int, device: torch.device) -> int:
     rows_per_block = min(rows_per_block, 4)
     return rows_per_block
 
+@triton.jit
+def silu_mul_input_quant_fp8_kernel(
+    X,  # pointer to the input, shape (M, N) where N = 2*D
+    Y_quant,  # pointer to the quantized output, shape (M, D)
+    S,  # pointer to the scales, shape (M, NG)
+    stride_x_row,
+    stride_x_col,
+    stride_y_row,
+    stride_s_row,
+    M,  # number of rows
+    D,  # half of N (output dim)
+    G: tl.constexpr,  # group size
+    BLOCK_G: tl.constexpr,  # next_power_of_2(G)
+    ROWS_PER_BLOCK: tl.constexpr,
+    FP8_MIN: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    USE_UE8M0: tl.constexpr,
+    FP8_MIN_SCALING_FACTOR: tl.constexpr,
+):
+    # program_id(0) -> row tile, program_id(1) -> group index within D
+    rows = tl.program_id(0) * ROWS_PER_BLOCK + tl.arange(0, ROWS_PER_BLOCK)
+    my_group = tl.program_id(1)
+    row_mask = rows < M
+    cols = tl.arange(0, BLOCK_G)
+
+    # Column offsets within D for this group
+    col_off = my_group * G + cols
+    mask = row_mask[:, None] & ((col_off < D) & (cols < G))[None, :]
+
+    # Load gate (first half) and up (second half)
+    gate_ptr = X + rows[:, None] * stride_x_row + col_off[None, :] * stride_x_col
+    up_ptr = X + rows[:, None] * stride_x_row + (col_off[None, :] + D) * stride_x_col
+
+    gate = tl.load(gate_ptr, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(up_ptr, mask=mask, other=0.0).to(tl.float32)
+
+    # SiLU(gate) * up
+    y = (gate * tl.sigmoid(gate)) * up
+
+    # Per-group FP8 quantization
+    group_absmax = tl.max(tl.where(mask, tl.abs(y), 0.0), axis=1)
+    scale_raw = group_absmax / FP8_MAX
+    if USE_UE8M0:
+        scale_raw = tl.exp2(tl.ceil(tl.log2(scale_raw)))
+    scale = tl.maximum(scale_raw, FP8_MIN_SCALING_FACTOR)
+
+    # Store scales (one per row per group)
+    tl.store(S + rows * stride_s_row + my_group, scale, mask=row_mask)
+
+    # Quantize and store
+    y_scaled = y / scale[:, None]
+    y_quant = tl.maximum(tl.minimum(y_scaled, FP8_MAX), FP8_MIN)
+
+    y_ptr = Y_quant + rows[:, None] * stride_y_row + col_off[None, :]
+    tl.store(y_ptr, y_quant.to(Y_quant.dtype.element_ty), mask=mask)
+
+
 @triton.heuristics(
     {
         "HAS_BIAS": lambda args: args["B"] is not None,
@@ -211,6 +268,7 @@ class QuantFP8(CustomOp):
         scale_ub: torch.Tensor | None = None,
         use_triton: bool = False,
         rms_norm_parameters: dict | None = None,
+        silu_mul: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from vllm.model_executor.layers.quantization.utils import fp8_utils
 
@@ -263,6 +321,7 @@ class QuantFP8(CustomOp):
         scale_ub: torch.Tensor | None = None,
         use_triton: bool = False,
         rms_norm_parameters: dict | None = None,
+        silu_mul: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.is_group_quant and use_triton:
             assert scale is None, "Dynamic group quantization does not use scale"
@@ -299,6 +358,7 @@ class QuantFP8(CustomOp):
         scale_ub: torch.Tensor | None = None,
         use_triton: bool = False,
         rms_norm_parameters: dict | None = None,
+        silu_mul: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # XPU can use same code path as CUDA.
         return self.forward_cuda(x, scale, scale_ub, use_triton)
@@ -310,13 +370,16 @@ class QuantFP8(CustomOp):
         scale_ub: torch.Tensor | None = None,
         use_triton: bool = False,
         rms_norm_parameters: dict | None = None,
+        silu_mul: bool = False,
     ):
         if self.is_group_quant and not self.static:
             assert scale is None, "Dynamic group quantization does not use scale"
-            if rms_norm_parameters is None:
-                return self._quantize_group_native(x)
+            if rms_norm_parameters is not None:
+                return self._rmsnorm_quantize_group_native(x, rms_norm_parameters)
+            elif silu_mul:
+                return self._silu_mul_quantize_group_native(x)
             else:
-                return self._quantize_group_native_rmsnorm(x, rms_norm_parameters)
+                return self._quantize_group_native(x)
 
         assert (scale is not None) == self.static
         assert scale_ub is None or (
@@ -391,7 +454,7 @@ class QuantFP8(CustomOp):
 
         return x_quant, scales
 
-    def _quantize_group_native_rmsnorm(
+    def _rmsnorm_quantize_group_native(
         self, 
         x: torch.Tensor, # (n, h, d)
         rms_norm_parameters: dict,
@@ -470,3 +533,56 @@ class QuantFP8(CustomOp):
         scales = scales.view(num_tokens, -1)
 
         return x_quant, scales
+
+    def _silu_mul_quantize_group_native(
+        self, 
+        x: torch.Tensor,  # (M, N) where N = 2*D
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+
+        assert not self.column_major_scales, "column major for scales is not supported in this kernel"
+
+        x_shape = x.shape
+        x = x.view(-1, x_shape[-1])
+        M, N = x.shape
+        assert N % 2 == 0, f"N must be even for silu_mul, got N={N}"
+        D = N // 2  # output dim after silu_mul
+
+        ng = cdiv(D, self.group_size)
+        BLOCK_G = triton.next_power_of_2(self.group_size)
+
+        MAX_FUSED_SIZE = 65536 // x.element_size()
+        if BLOCK_G > MAX_FUSED_SIZE:
+            raise RuntimeError("This kernel doesn't support group_size >= 64KB.")
+
+        num_warps = min(max(BLOCK_G // 256, 1), 8)
+        rows_per_block = calc_rows_per_block(M, x.device)
+
+        y_quant = torch.empty((M, D), dtype=_FP8_DTYPE, device=x.device)
+        scales = torch.empty((M, ng), dtype=torch.float32, device=x.device)
+
+        grid = (cdiv(M, rows_per_block), ng)
+        silu_mul_input_quant_fp8_kernel[grid](
+            x,
+            y_quant,
+            scales,
+            x.stride(0),
+            x.stride(1),
+            y_quant.stride(0),
+            scales.stride(0),
+            M,
+            D,
+            self.group_size,
+            BLOCK_G=BLOCK_G,
+            ROWS_PER_BLOCK=rows_per_block,
+            FP8_MIN=_FP8_MIN,
+            FP8_MAX=_FP8_MAX,
+            USE_UE8M0=self.use_ue8m0,
+            FP8_MIN_SCALING_FACTOR=_FP8_MIN_SCALING_FACTOR,
+            num_warps=num_warps,
+        )
+
+        out_shape = x_shape[:-1] + (D,)
+        y_quant = y_quant.view(out_shape)
+        scales = scales.view(x_shape[:-1] + (ng,))
+
+        return y_quant, scales
