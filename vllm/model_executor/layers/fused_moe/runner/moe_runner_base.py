@@ -186,6 +186,8 @@ class MoERunnerBase(MoERunner):
         routed_input_transform: torch.nn.Module | None,
         gate: torch.nn.Module | None,
         shared_experts: torch.nn.Module | None,
+        shared_expert_gate: torch.nn.Module | None,
+        num_fused_shared_experts: int,
         quant_method: FusedMoEMethodBase,
         reduce_results: bool,
         enable_dbo: bool,
@@ -195,9 +197,26 @@ class MoERunnerBase(MoERunner):
         self.router = router
         self.routed_input_transform = routed_input_transform
         self.gate = gate
+        self.shared_expert_gate = shared_expert_gate
+        self.num_fused_shared_experts = num_fused_shared_experts
         self.quant_method = quant_method
         self._reduce_results = reduce_results
         self.enable_dbo = enable_dbo
+
+        # When both gates are present and FSE is enabled, fuse their
+        # weight matrices into [num_experts + num_shared, hidden] so one
+        # F.linear produces combined logits. The topk kernel can then
+        # apply routing softmax and shared expert activation (sigmoid)
+        # in a single launch.
+        #
+        # Actual weight fusion is deferred to _maybe_fuse_gate_weights()
+        # because gate weights are not yet loaded at __init__ time.
+        self._fse_fuse_gate = (
+            gate is not None
+            and shared_expert_gate is not None
+            and num_fused_shared_experts > 0
+        )
+        self._combined_gate_weight: torch.Tensor | None = None
 
         self._shared_experts: SharedExperts | None = None
         if shared_experts is not None:
@@ -405,6 +424,10 @@ class MoERunnerBase(MoERunner):
             topk_weights, topk_ids = self.router.select_experts(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
+                num_fused_shared_experts=(
+                    self.num_fused_shared_experts
+                    if self._fse_fuse_gate else 0
+                ),
             )
 
             # Passing shared_experts_input in case SharedExpertsOrder is
@@ -514,6 +537,19 @@ class MoERunnerBase(MoERunner):
 
         return self._maybe_add_zero_expert_output(result)
 
+    def _maybe_fuse_gate_weights(self):
+        """Fuse router and shared expert gate weights on first call.
+
+        Cannot be done at __init__ because gate weights are loaded after
+        module construction (via weight_loader). Called once from
+        forward_dispatch before the first forward pass.
+        """
+        if self._combined_gate_weight is None:
+            self._combined_gate_weight = torch.cat(
+                [self.gate.weight, self.shared_expert_gate.weight],
+                dim=0,
+            )
+
     def forward_dispatch(
         self,
         layer: torch.nn.Module,
@@ -531,7 +567,13 @@ class MoERunnerBase(MoERunner):
         # so it can run overlapped with the
         # NOTE: in future PR, MoE runner will always hold the gate.
         if self.gate is not None:
-            router_logits, _ = self.gate(hidden_states)
+            if self._fse_fuse_gate:
+                self._maybe_fuse_gate_weights()
+                router_logits = F.linear(
+                    hidden_states, self._combined_gate_weight
+                )
+            else:
+                router_logits, _ = self.gate(hidden_states)
 
         with self._sequence_parallel_context():
             return self._forward_impl(
