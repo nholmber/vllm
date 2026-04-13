@@ -274,6 +274,7 @@ class FusedMoE(CustomOp):
         router_logits_dtype: torch.dtype | None = None,
         gate: torch.nn.Module | None = None,
         shared_experts: torch.nn.Module | None = None,
+        shared_expert_gate: torch.nn.Module | None = None,
         routed_input_transform: torch.nn.Module | None = None,
     ):
         super().__init__()
@@ -360,6 +361,7 @@ class FusedMoE(CustomOp):
                 "n_shared_experts is only supported on ROCm aiter when "
                 "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS is enabled"
             )
+        self.shared_expert_gate = shared_expert_gate
 
         # Determine expert maps
         if self.use_ep:
@@ -579,6 +581,8 @@ class FusedMoE(CustomOp):
             routed_input_transform=self._routed_input_transform,
             gate=gate,
             shared_experts=shared_experts,
+            shared_expert_gate=shared_expert_gate,
+            num_fused_shared_experts=self.num_fused_shared_experts,
             quant_method=self.quant_method,
             reduce_results=self.reduce_results,
             enable_dbo=self.vllm_config.parallel_config.enable_dbo,
