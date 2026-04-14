@@ -4,10 +4,6 @@
 import torch
 import torch.nn.functional as F
 
-from vllm.triton_utils import tl, triton
-from vllm.utils.math_utils import cdiv, next_power_of_2
-from vllm.utils.platform_utils import num_compute_units
-
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.model_executor.custom_op import CustomOp
@@ -27,127 +23,6 @@ from vllm.utils.deep_gemm import (
 _FP8_DTYPE = current_platform.fp8_dtype()
 _FP8_MIN, _FP8_MAX = get_fp8_min_max()
 _FP8_MIN_SCALING_FACTOR = 1.0 / (_FP8_MAX * 512.0)
-
-
-def calc_rows_per_block(M: int, device: torch.device) -> int:
-    sm_count = num_compute_units(device.index)
-    rows_per_block = next_power_of_2(cdiv(M, 2 * sm_count))
-    rows_per_block = min(rows_per_block, 4)
-    return rows_per_block
-
-@triton.heuristics(
-    {
-        "HAS_BIAS": lambda args: args["B"] is not None,
-        "HAS_Z": lambda args: args["Z"] is not None,
-    }
-)
-@triton.jit
-def rms_norm_input_quant_fp8_kernel(
-    X,  # pointer to the input
-    W,  # pointer to the weights
-    B,  # pointer to the biases
-    Z,  # pointer to the other branch
-    Y_quant, # pointer to the quantized output
-    Scales, # pointer to the scales
-    stride_x_row,  # how much to increase the pointer when moving by 1 row
-    stride_z_row,
-    stride_y_row,
-    M,  # number of rows in X
-    N: tl.constexpr,  # number of columns in X
-    eps,  # epsilon to avoid division by zero
-    BLOCK_N: tl.constexpr,
-    ROWS_PER_BLOCK: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
-    HAS_Z: tl.constexpr,
-    NORM_BEFORE_GATE: tl.constexpr,
-    FP8_MIN: tl.constexpr,
-    FP8_MAX: tl.constexpr,
-    USE_UE8M0: tl.constexpr,
-    FP8_MIN_SCALING_FACTOR: tl.constexpr,
-    ACTIVATION: tl.constexpr,
-):
-    # Map the program id to the starting row of X and Y it should compute.
-    row_start = tl.program_id(0) * ROWS_PER_BLOCK
-    group = tl.program_id(1)
-
-    # Create 2D tile: [ROWS_PER_BLOCK, BLOCK_N]
-    rows = row_start + tl.arange(0, ROWS_PER_BLOCK)
-    cols = tl.arange(0, BLOCK_N)
-
-    # Compute offsets for 2D tile
-    row_offsets = rows[:, None] * stride_x_row
-    col_offsets = cols[None, :] + group * BLOCK_N
-
-    # Base pointers
-    X_base = X + row_offsets + col_offsets
-    Y_base = Y_quant + rows[:, None] * stride_y_row + col_offsets
-    S_base = Scales + rows
-
-    # Create mask for valid rows and columns
-    row_mask = rows[:, None] < M
-    col_mask = cols[None, :] < N
-    mask = row_mask & col_mask
-
-    # Load input data with 2D tile
-    x = tl.load(X_base, mask=mask, other=0.0).to(tl.float32)
-
-    if HAS_Z and not NORM_BEFORE_GATE:
-        Z_base = Z + rows[:, None] * stride_z_row + col_offsets
-        z = tl.load(Z_base, mask=mask, other=0.0).to(tl.float32)
-        if ACTIVATION == "swish" or ACTIVATION == "silu":
-            x *= z * tl.sigmoid(z)
-        elif ACTIVATION == "sigmoid":
-            x *= tl.sigmoid(z)
-
-    xbar = tl.where(mask, x, 0.0)
-    var = tl.sum(xbar * xbar, axis=1) / N  # Shape: [ROWS_PER_BLOCK]
-    rstd = tl.rsqrt(var + eps)  # Shape: [ROWS_PER_BLOCK]
-
-    # Load weights and biases (broadcast across rows)
-    w_offsets = cols + group * BLOCK_N
-    w_mask = w_offsets < N
-    w = tl.load(W + w_offsets, mask=w_mask, other=0.0).to(tl.float32)
-
-    if HAS_BIAS:
-        b = tl.load(B + w_offsets, mask=w_mask, other=0.0).to(tl.float32)
-
-    # Normalize and apply linear transformation
-    x_hat = x * rstd[:, None]
-
-    y = x_hat * w[None, :] + b[None, :] if HAS_BIAS else x_hat * w[None, :]
-
-    if HAS_Z and NORM_BEFORE_GATE:
-        Z_base = Z + rows[:, None] * stride_z_row + col_offsets
-        z = tl.load(Z_base, mask=mask, other=0.0).to(tl.float32)
-        if ACTIVATION == "swish" or ACTIVATION == "silu":
-            y *= z * tl.sigmoid(z)
-        elif ACTIVATION == "sigmoid":
-            y *= tl.sigmoid(z)
-
-    ## Now we got y, we next quantize y
-
-    # Compute per-row absmax (only considering valid elements)
-    abs_y = tl.where(mask, tl.abs(y), 0.0)
-    absmax = tl.max(abs_y, axis=1)  # Shape: [ROWS_PER_BLOCK]
-    
-    # Compute scales
-    scales_raw = absmax / FP8_MAX
-    # TODO: Add USE_UE8M0 as a constexpr parameter if needed:
-    if USE_UE8M0:
-        scales_raw = tl.exp2(tl.ceil(tl.log2(scales_raw)))
-    scales = tl.maximum(scales_raw, FP8_MIN_SCALING_FACTOR)  # Shape: [ROWS_PER_BLOCK]
-    
-    # Quantize: divide by scale (broadcast to match y shape) and clamp
-    y_scaled = y / scales[:, None]  # Broadcast scales from [ROWS_PER_BLOCK] to [ROWS_PER_BLOCK, BLOCK_N]
-    y_quant = tl.maximum(tl.minimum(y_scaled, FP8_MAX), FP8_MIN)
-    
-    # Store quantized output
-    tl.store(Y_base, y_quant.to(Y_quant.dtype.element_ty), mask=mask)
-    
-    # Store scales (one per row)
-    scales_row_mask = rows < M
-    tl.store(S_base, scales, mask=scales_row_mask)
-
 
 # --8<-- [start:quant_fp8]
 @CustomOp.register("quant_fp8")
@@ -313,10 +188,10 @@ class QuantFP8(CustomOp):
     ):
         if self.is_group_quant and not self.static:
             assert scale is None, "Dynamic group quantization does not use scale"
-            if rms_norm_parameters is None:
-                return self._quantize_group_native(x)
+            if rms_norm_parameters is not None:
+                return self._rmsnorm_quantize_group_native(x, rms_norm_parameters)
             else:
-                return self._quantize_group_native_rmsnorm(x, rms_norm_parameters)
+                return self._quantize_group_native(x)
 
         assert (scale is not None) == self.static
         assert scale_ub is None or (
@@ -391,7 +266,7 @@ class QuantFP8(CustomOp):
 
         return x_quant, scales
 
-    def _quantize_group_native_rmsnorm(
+    def _rmsnorm_quantize_group_native(
         self, 
         x: torch.Tensor, # (n, h, d)
         rms_norm_parameters: dict,
@@ -406,6 +281,7 @@ class QuantFP8(CustomOp):
         eps = rms_norm_parameters["eps"]
         norm_before_gate = rms_norm_parameters["norm_before_gate"]
         activation = rms_norm_parameters["activation"]
+        core_kernel = rms_norm_parameters["core_kernel"]
 
         assert norm_group_size is None, "group_size in rms norm should be None"
         assert norm_before_gate, "norm_before_gate should be True"
@@ -424,46 +300,20 @@ class QuantFP8(CustomOp):
         if bias is not None:
             bias = bias.contiguous()
 
-        ## now we do the job
-        M = x.shape[0]
-        group_size = head_dim
-        ngroups = 1
-        # Less than 64KB per feature: enqueue fused kernel
-        MAX_FUSED_SIZE = 65536 // x.element_size()
-        BLOCK_N = min(MAX_FUSED_SIZE, triton.next_power_of_2(group_size))
-        if group_size > BLOCK_N:
-            raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
-        # heuristics for number of warps
-        num_warps = min(max(BLOCK_N // 256, 1), 8)
-        # Calculate rows per block based on SM count
-        rows_per_block = calc_rows_per_block(M, x.device)
-
-        x_quant = torch.empty_like(x, dtype=_FP8_DTYPE)
-        scales = torch.empty(M, dtype=torch.float32, device=x.device)
-
-        grid = (cdiv(M, rows_per_block), ngroups)
-        rms_norm_input_quant_fp8_kernel[grid](
+        x_quant, scales = core_kernel(
             x,
             weight,
             bias,
             z,
-            x_quant,
-            scales,
-            x.stride(0),
-            z.stride(0) if z is not None else 0,
-            x_quant.stride(0),
-            M,
-            group_size,
             eps,
-            BLOCK_N=BLOCK_N,
-            ROWS_PER_BLOCK=rows_per_block,
-            NORM_BEFORE_GATE=norm_before_gate,
-            FP8_MIN=_FP8_MIN,
-            FP8_MAX=_FP8_MAX,
-            USE_UE8M0=self.use_ue8m0,
-            FP8_MIN_SCALING_FACTOR=_FP8_MIN_SCALING_FACTOR,
-            num_warps=num_warps,
-            ACTIVATION=activation,
+            norm_before_gate=norm_before_gate,
+            use_ue8m0=self.use_ue8m0,
+            activation=activation,
+            out_dtype=_FP8_DTYPE,
+            fp8_min=_FP8_MIN,
+            fp8_max=_FP8_MAX,
+            fp8_min_scaling_factor=_FP8_MIN_SCALING_FACTOR,
+            group_size=self.group_size,
         )
 
         x_quant = x_quant.view(num_tokens, -1)
