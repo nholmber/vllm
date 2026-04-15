@@ -665,7 +665,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         """
         num_tokens = hidden_states.size(0)
         # ============================================================
-        # Fast path for with Triton decode kernels
+        # Fast path for with Triton decode kernels for part 1&2
         # ============================================================
         if (
             not hasattr(self, "in_proj_qkv") 
@@ -694,29 +694,6 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                 True,
                 self.prefix,
             )
-            quant_method = self.out_proj.quant_method.__class__.__name__
-            if quant_method == "Fp8LinearMethod":
-                rms_norm_parameters = {
-                    "z": z,
-                    "weight": self.norm.weight,
-                    "bias": self.norm.bias,
-                    "group_size": self.norm.group_size,
-                    "eps": self.norm.eps,
-                    "norm_before_gate": self.norm.norm_before_gate,
-                    "activation": self.norm.activation,
-                    "core_kernel": gdn_aiter_rmsnorm_fp8_quant,
-                }
-                core_attn_out = core_attn_out.view(num_tokens, -1)
-                output[:num_tokens], _ = self.out_proj(core_attn_out, rms_norm_parameters)
-            else:
-                z_shape_og = z.shape
-                # Reshape input data into 2D tensor
-                core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-                z = z.reshape(-1, z.shape[-1])
-                core_attn_out = self.norm(core_attn_out, z)
-                core_attn_out = core_attn_out.reshape(z_shape_og)
-                core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
-                output[:num_tokens], _ = self.out_proj(core_attn_out)
         else:
             # ============================================================
             # Part 1: Input Projection
@@ -773,9 +750,27 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                 self.prefix,
             )
 
-            # ============================================================
-            # Part 3: Output Projection
-            # ============================================================
+        # ============================================================
+        # Part 3: Output Projection
+        # ============================================================
+        quant_method = self.out_proj.quant_method.__class__.__name__
+        if (
+            GDN_AITER_TRITON_AVAILABLE
+            and quant_method == "Fp8LinearMethod"
+        ):
+            rms_norm_parameters = {
+                "z": z,
+                "weight": self.norm.weight,
+                "bias": self.norm.bias,
+                "group_size": self.norm.group_size,
+                "eps": self.norm.eps,
+                "norm_before_gate": self.norm.norm_before_gate,
+                "activation": self.norm.activation,
+                "core_kernel": gdn_aiter_rmsnorm_fp8_quant,
+            }
+            core_attn_out = core_attn_out.view(num_tokens, -1)
+            output[:num_tokens], _ = self.out_proj(core_attn_out, rms_norm_parameters)
+        else:
             z_shape_og = z.shape
             # Reshape input data into 2D tensor
             core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
