@@ -424,7 +424,7 @@ class AiterExperts(mk.FusedMoEExpertsModular):
         else:
             num_local_tokens = None
 
-        rocm_aiter_fused_experts(
+        result = rocm_aiter_fused_experts(
             hidden_states=hidden_states,
             w1=w1,
             w2=w2,
@@ -440,3 +440,5 @@ class AiterExperts(mk.FusedMoEExpertsModular):
             output_dtype=output.dtype,
             moe_buf=output,
         )
+        if result is not output:
+            output.copy_(result)

@@ -100,6 +100,18 @@ def if_aiter_supported(func: Callable) -> Callable:
     return wrapper
 
 
+@functools.cache
+def _aiter_fused_moe_supports_moe_buf() -> bool:
+    """Check if the installed AITER version supports the moe_buf parameter."""
+    try:
+        import inspect
+
+        from aiter.fused_moe import fused_moe
+        return "moe_buf" in inspect.signature(fused_moe).parameters
+    except Exception:
+        return False
+
+
 def _rocm_aiter_fused_moe_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -128,6 +140,17 @@ def _rocm_aiter_fused_moe_impl(
     activation = ActivationType(activation_method)
     quant_type = QuantType(quant_method)
 
+    kwargs: dict = dict(
+        num_local_tokens=num_local_tokens,
+        dtype=output_dtype,
+        hidden_pad=hidden_pad,
+        intermediate_pad=intermediate_pad,
+        bias1=bias1,
+        bias2=bias2,
+    )
+    if moe_buf is not None and _aiter_fused_moe_supports_moe_buf():
+        kwargs["moe_buf"] = moe_buf
+
     return fused_moe(
         hidden_states,
         w1,
@@ -142,13 +165,7 @@ def _rocm_aiter_fused_moe_impl(
         w2_scale,
         a1_scale,
         a2_scale,
-        num_local_tokens=num_local_tokens,
-        dtype=output_dtype,
-        hidden_pad=hidden_pad,
-        intermediate_pad=intermediate_pad,
-        bias1=bias1,
-        bias2=bias2,
-        moe_buf=moe_buf,
+        **kwargs,
     )
 
 
