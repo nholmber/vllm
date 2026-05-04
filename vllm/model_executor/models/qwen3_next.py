@@ -187,13 +187,13 @@ class Qwen3NextSparseMoeBlock(nn.Module):
 
         if self.experts.is_internal_router:
             # In this case, the gate/router runs inside the FusedMoE class
-            shared_out, final_hidden_states = self.experts(
+            final_hidden_states = self.experts(
                 hidden_states=hidden_states, router_logits=hidden_states
             )
         else:
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
-            shared_out, final_hidden_states = self.experts(
+            final_hidden_states = self.experts(
                 hidden_states=hidden_states, router_logits=router_logits
             )
 
