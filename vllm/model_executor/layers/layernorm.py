@@ -159,7 +159,7 @@ class GemmaRMSNorm(CustomOp):
         if residual is None:
             return ir.ops.rms_norm(x, weight, self.variance_epsilon)
         else:
-            return ir.ops.fused_add_rms_norm(
+            return ir.ops.fused_add_rms_norm.maybe_inplace(
                 x, residual, weight, self.variance_epsilon)
 
     def forward_cuda(

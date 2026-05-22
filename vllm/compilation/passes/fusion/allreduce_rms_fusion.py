@@ -47,10 +47,6 @@ from .matcher_utils import MatcherQuantFP8
 
 FP8_DTYPE = current_platform.fp8_dtype()
 
-
-# The empirical value for small batch
-PDL_ADVANCE_LAUNCH_TOKENS = 16
-
 logger = init_logger(__name__)
 
 flashinfer_comm: ModuleType | None = None
@@ -211,7 +207,6 @@ if flashinfer_comm is not None:
             layout_code=layout_code,
             use_oneshot=use_oneshot,
             fp32_acc=fp32_acc,
-            trigger_completion_at_end=num_tokens > PDL_ADVANCE_LAUNCH_TOKENS,
         )
 
     def call_trtllm_fused_allreduce_norm_fake(
@@ -1287,6 +1282,87 @@ class AiterAllreduceFusedAddRMSNormGroupQuantWithIndexerPattern(
         return _replacement
 
 
+
+
+class AiterAllreduceFusedAddRMSNormGroupQuantWithResidualCopyPattern(
+    BasePattern, VllmPatternReplacement
+):
+    """Handles all_reduce with 2 users (fused_add_rms_norm + copy_).
+    Returns ar_out as pattern output so copy_ rewires to res_out."""
+
+    def __init__(self, epsilon, dtype, device, group_size=128):
+        super().__init__(dtype, device)
+        self.epsilon = epsilon
+        self.dtype = dtype
+        self.group_size = group_size
+        self.FUSED_OP = (
+            rocm_aiter_ops.get_fused_allreduce_rmsnorm_quant_per_group_with_bf16_norm_op()
+        )
+
+    def get_inputs(self):
+        h = self.group_size
+        return [self.empty(5, h), self.empty(5, h), self.empty(h)]
+
+    @property
+    def pattern(self):
+        eps = self.epsilon
+        gs = self.group_size
+        def _pattern(residual, input_, norm_weight):
+            ar_out = tensor_model_parallel_all_reduce(input_)
+            rms, res_out = vllm.ir.ops.fused_add_rms_norm(
+                ar_out, residual, norm_weight, eps)
+            q, s = torch.ops.vllm.triton_per_token_group_quant_fp8(rms, gs)
+            return q, s, res_out, ar_out
+        return _pattern
+
+    @property
+    def replacement(self):
+        gs = self.group_size
+        eps = self.epsilon
+        def _replacement(residual, input_, norm_weight):
+            fused = self.FUSED_OP(
+                input_=input_, residual=residual,
+                weight=norm_weight.to(input_.dtype),
+                epsilon=eps, group_size=gs)
+            quant_out, residual_out, scale_out, bf16_norm = (
+                fused[0], fused[1], fused[2], fused[3])
+            return quant_out, scale_out, residual_out, residual_out
+        return _replacement
+
+
+class AiterAllreduceFusedAddRMSNormWithCopyPattern(
+    BasePattern, VllmPatternReplacement
+):
+    """Non-quant AR+RMS fusion for all_reduce with 2 users (copy_)."""
+
+    def __init__(self, epsilon, dtype, device):
+        super().__init__(dtype, device)
+        self.epsilon = epsilon
+        self.FUSED_OP = rocm_aiter_ops.get_fused_allreduce_rmsnorm_op()
+
+    def get_inputs(self):
+        return [self.empty(5, 16), self.empty(5, 16), self.empty(16)]
+
+    @property
+    def pattern(self):
+        eps = self.epsilon
+        def _pattern(residual, input_, weight):
+            ar_out = tensor_model_parallel_all_reduce(input_)
+            rms, res_out = vllm.ir.ops.fused_add_rms_norm(
+                ar_out, residual, weight, eps)
+            return rms, res_out, ar_out
+        return _pattern
+
+    @property
+    def replacement(self):
+        eps = self.epsilon
+        def _replacement(residual, input_, weight):
+            fused = self.FUSED_OP(
+                input_=input_, residual=residual,
+                weight=weight.to(input_.dtype), epsilon=eps)
+            return fused[0], fused[1], fused[1]
+        return _replacement
+
 class RocmAiterAllReduceFusionPass(VllmFusionPatternMatcherPass):
     def __init__(self, config: VllmConfig) -> None:
         super().__init__(config, "rocm_aiter_allreduce_fusion_pass")
@@ -1372,6 +1448,20 @@ class RocmAiterAllReduceFusionPass(VllmFusionPatternMatcherPass):
                 "FP8 quant fusion."
             )
 
+        has_quant_bf16 = rocm_aiter_ops.has_fused_allreduce_rmsnorm_quant_per_group()
+        # Non-quant copy pattern for post-attention allreduce
+        for epsilon in [1e-5, 1e-6]:
+            self.register(
+                AiterAllreduceFusedAddRMSNormWithCopyPattern(
+                    epsilon, self.model_dtype, self.device))
+            torch._inductor.pattern_matcher._seen_patterns.clear()
+
+        for epsilon in [1e-5, 1e-6]:
+            if has_quant_bf16:
+                self.register(
+                    AiterAllreduceFusedAddRMSNormGroupQuantWithResidualCopyPattern(
+                        epsilon, self.model_dtype, self.device))
+                torch._inductor.pattern_matcher._seen_patterns.clear()
         for epsilon in [1e-5, 1e-6]:
             # Quant-fused variants must register first so the pattern matcher
             # tries them before the AR+RMS-only variants. Otherwise the
