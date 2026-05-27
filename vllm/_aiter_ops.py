@@ -771,6 +771,19 @@ def _rocm_aiter_fused_allreduce_rmsnorm_impl(
     aiter_ar = rocm_aiter_ops.get_aiter_allreduce()
     assert aiter_ar is not None, "aiter allreduce must be initialized"
 
+    # For large batches (prefill), fall back to quickreduce + native rmsnorm.
+    # The fused kernel's 2-stage allreduce is slower than quickreduce.
+    token_num = input_.shape[0]
+    if token_num > 512:
+        from vllm.distributed.communication_op import (
+            tensor_model_parallel_all_reduce,
+        )
+
+        allreduced = tensor_model_parallel_all_reduce(input_)
+        # fused_add_rms_norm: in-place, fp32 intermediates
+        torch.ops._C.fused_add_rms_norm(allreduced, residual, weight, epsilon)
+        return allreduced, residual
+
     total_bytes = input_.numel() * input_.element_size()
     hidden_dim = input_.shape[-1]
     token_num = input_.shape[0]
@@ -828,6 +841,24 @@ def _rocm_aiter_fused_allreduce_rmsnorm_quant_per_group_impl(
     for the 1-stage vs 2-stage AITER kernel dispatch (both variants run inside
     AITER, the only choice we make here is the launcher to call into).
     """
+
+    # For large batches (prefill), fall back to quickreduce + native rmsnorm.
+    token_num = input_.shape[0]
+    if token_num > 512:
+        from vllm._custom_ops import scaled_fp8_quant
+        from vllm.distributed.communication_op import (
+            tensor_model_parallel_all_reduce,
+        )
+
+        allreduced = tensor_model_parallel_all_reduce(input_)
+        torch.ops._C.fused_add_rms_norm(allreduced, residual, weight, epsilon)
+        quant_out, scales = scaled_fp8_quant(
+            allreduced,
+            use_per_token_if_dynamic=True,
+            group_shape=(1, group_size),
+        )
+        return quant_out, residual, scales
+
     aiter_ar = rocm_aiter_ops.get_aiter_allreduce()
     assert aiter_ar is not None, "aiter allreduce must be initialized"
 
@@ -900,6 +931,25 @@ def _rocm_aiter_fused_allreduce_rmsnorm_quant_per_group_with_bf16_norm_impl(
     bf16/fp16 normed activation for a parallel consumer (DeepSeek V3.2 sparse
     indexer ``wk_weights_proj``).
     """
+
+    # For large batches (prefill), fall back to quickreduce + native rmsnorm.
+    token_num = input_.shape[0]
+    if token_num > 512:
+        from vllm._custom_ops import scaled_fp8_quant
+        from vllm.distributed.communication_op import (
+            tensor_model_parallel_all_reduce,
+        )
+
+        allreduced = tensor_model_parallel_all_reduce(input_)
+        torch.ops._C.fused_add_rms_norm(allreduced, residual, weight, epsilon)
+        rms_out = allreduced.clone()  # save bf16 norm before quant overwrites
+        quant_out, scales = scaled_fp8_quant(
+            allreduced,
+            use_per_token_if_dynamic=True,
+            group_shape=(1, group_size),
+        )
+        return quant_out, residual, scales, rms_out
+
     aiter_ar = rocm_aiter_ops.get_aiter_allreduce()
     assert aiter_ar is not None, "aiter allreduce must be initialized"
 
