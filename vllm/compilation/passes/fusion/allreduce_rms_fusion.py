@@ -1282,8 +1282,6 @@ class AiterAllreduceFusedAddRMSNormGroupQuantWithIndexerPattern(
         return _replacement
 
 
-
-
 class AiterAllreduceFusedAddRMSNormGroupQuantWithResidualCopyPattern(
     BasePattern, VllmPatternReplacement
 ):
@@ -1295,9 +1293,10 @@ class AiterAllreduceFusedAddRMSNormGroupQuantWithResidualCopyPattern(
         self.epsilon = epsilon
         self.dtype = dtype
         self.group_size = group_size
-        self.FUSED_OP = (
-            rocm_aiter_ops.get_fused_allreduce_rmsnorm_quant_per_group_with_bf16_norm_op()
-        )
+        get_op = (
+            rocm_aiter_ops.get_fused_allreduce_rmsnorm_quant_per_group_with_bf16_norm_op
+        )  # noqa: E501
+        self.FUSED_OP = get_op()
 
     def get_inputs(self):
         h = self.group_size
@@ -1307,32 +1306,42 @@ class AiterAllreduceFusedAddRMSNormGroupQuantWithResidualCopyPattern(
     def pattern(self):
         eps = self.epsilon
         gs = self.group_size
+
         def _pattern(residual, input_, norm_weight):
             ar_out = tensor_model_parallel_all_reduce(input_)
             rms, res_out = vllm.ir.ops.fused_add_rms_norm(
-                ar_out, residual, norm_weight, eps)
+                ar_out, residual, norm_weight, eps
+            )
             q, s = torch.ops.vllm.triton_per_token_group_quant_fp8(rms, gs)
             return q, s, res_out, ar_out
+
         return _pattern
 
     @property
     def replacement(self):
         gs = self.group_size
         eps = self.epsilon
+
         def _replacement(residual, input_, norm_weight):
             fused = self.FUSED_OP(
-                input_=input_, residual=residual,
+                input_=input_,
+                residual=residual,
                 weight=norm_weight.to(input_.dtype),
-                epsilon=eps, group_size=gs)
-            quant_out, residual_out, scale_out, bf16_norm = (
-                fused[0], fused[1], fused[2], fused[3])
+                epsilon=eps,
+                group_size=gs,
+            )
+            quant_out, residual_out, scale_out, _ = (
+                fused[0],
+                fused[1],
+                fused[2],
+                fused[3],
+            )
             return quant_out, scale_out, residual_out, residual_out
+
         return _replacement
 
 
-class AiterAllreduceFusedAddRMSNormWithCopyPattern(
-    BasePattern, VllmPatternReplacement
-):
+class AiterAllreduceFusedAddRMSNormWithCopyPattern(BasePattern, VllmPatternReplacement):
     """Non-quant AR+RMS fusion for all_reduce with 2 users (copy_)."""
 
     def __init__(self, epsilon, dtype, device):
@@ -1346,22 +1355,29 @@ class AiterAllreduceFusedAddRMSNormWithCopyPattern(
     @property
     def pattern(self):
         eps = self.epsilon
+
         def _pattern(residual, input_, weight):
             ar_out = tensor_model_parallel_all_reduce(input_)
-            rms, res_out = vllm.ir.ops.fused_add_rms_norm(
-                ar_out, residual, weight, eps)
+            rms, res_out = vllm.ir.ops.fused_add_rms_norm(ar_out, residual, weight, eps)
             return rms, res_out, ar_out
+
         return _pattern
 
     @property
     def replacement(self):
         eps = self.epsilon
+
         def _replacement(residual, input_, weight):
             fused = self.FUSED_OP(
-                input_=input_, residual=residual,
-                weight=weight.to(input_.dtype), epsilon=eps)
+                input_=input_,
+                residual=residual,
+                weight=weight.to(input_.dtype),
+                epsilon=eps,
+            )
             return fused[0], fused[1], fused[1]
+
         return _replacement
+
 
 class RocmAiterAllReduceFusionPass(VllmFusionPatternMatcherPass):
     def __init__(self, config: VllmConfig) -> None:
@@ -1427,9 +1443,13 @@ class RocmAiterAllReduceFusionPass(VllmFusionPatternMatcherPass):
             return
 
         max_token_num = max_size // (hidden_dim * element_size)
+        # Cap at max_cudagraph_capture_size so fusion only fires
+        # for decode. Prefill uses quickreduce + triton rmsnorm.
+        max_cg = config.compilation_config.max_cudagraph_capture_size or 512
         self.max_token_num = min(
             max_token_num,
             config.scheduler_config.max_num_batched_tokens,
+            max_cg,
         )
 
         # Only register the AR+RMS+per-group-FP8-quant patterns when the
@@ -1453,14 +1473,18 @@ class RocmAiterAllReduceFusionPass(VllmFusionPatternMatcherPass):
         for epsilon in [1e-5, 1e-6]:
             self.register(
                 AiterAllreduceFusedAddRMSNormWithCopyPattern(
-                    epsilon, self.model_dtype, self.device))
+                    epsilon, self.model_dtype, self.device
+                )
+            )
             torch._inductor.pattern_matcher._seen_patterns.clear()
 
         for epsilon in [1e-5, 1e-6]:
             if has_quant_bf16:
                 self.register(
                     AiterAllreduceFusedAddRMSNormGroupQuantWithResidualCopyPattern(
-                        epsilon, self.model_dtype, self.device))
+                        epsilon, self.model_dtype, self.device
+                    )
+                )
                 torch._inductor.pattern_matcher._seen_patterns.clear()
         for epsilon in [1e-5, 1e-6]:
             # Quant-fused variants must register first so the pattern matcher
