@@ -707,13 +707,14 @@ def _rocm_aiter_fp8_blockscale_group_quant_gemm_impl(
     m = x.shape[0]
     n = B.shape[0]
     Y = torch.empty(m, n, dtype=output_dtype, device=x.device)
-    # transpose_scale=True matches the column-major x_scale layout the
-    # blockscale GEMM consumes; the producer zero-fills Y as a side effect.
+    # transpose_scale=False produces row-major x_scale; the CKTile GEMM
+    # wrapper handles the row→col-major conversion internally for 8-warp
+    # kernels.  The producer zero-fills Y as a side effect.
     x_q, x_scale = per_group_quant_hip(
         x,
         quant_dtype=FP8_DTYPE,
         group_size=group_size,
-        transpose_scale=True,
+        transpose_scale=False,
         gemm_out_zero_init=Y,
     )
     return gemm_a8w8_blockscale(
