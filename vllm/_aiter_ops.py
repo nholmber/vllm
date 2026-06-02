@@ -1668,23 +1668,22 @@ class rocm_aiter_ops:
 
     @staticmethod
     def _probe_fused_zero_init_support() -> bool:
-        import inspect
+        from pathlib import Path
 
         try:
-            from aiter import gemm_a8w8_blockscale
-            from aiter.ops.quant import per_group_quant_hip
+            import aiter.ops.gemm_op_a8w8 as gemm_mod
+            import aiter.ops.quant as quant_mod
         except Exception:
             return False
+        # aiter JIT stubs expose (*args, **kwargs), so inspect.signature()
+        # cannot see named params.  Read the module source files directly
+        # to check for the required parameter names.
         try:
-            gemm_params = inspect.signature(gemm_a8w8_blockscale).parameters
-            quant_params = inspect.signature(per_group_quant_hip).parameters
-        except (TypeError, ValueError):
+            gemm_src = Path(gemm_mod.__file__).read_text()
+            quant_src = Path(quant_mod.__file__).read_text()
+        except (TypeError, OSError):
             return False
-        return (
-            "out" in gemm_params
-            and "y_is_zeroed" in gemm_params
-            and "gemm_out_zero_init" in quant_params
-        )
+        return "y_is_zeroed" in gemm_src and "gemm_out_zero_init" in quant_src
 
     @classmethod
     @if_aiter_supported
