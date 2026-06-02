@@ -702,30 +702,42 @@ def _rocm_aiter_fp8_blockscale_group_quant_gemm_impl(
         output_dtype: GEMM output dtype.
     """
     from aiter import gemm_a8w8_blockscale
+    from aiter.ops.gemm_op_a8w8 import AITER_CONFIGS, get_CKGEMM_config
     from aiter.ops.quant import per_group_quant_hip
 
     m = x.shape[0]
     n = B.shape[0]
-    Y = torch.empty(m, n, dtype=output_dtype, device=x.device)
-    # transpose_scale=False produces row-major x_scale; the CKTile GEMM
-    # wrapper handles the row→col-major conversion internally for 8-warp
-    # kernels.  The producer zero-fills Y as a side effect.
-    x_q, x_scale = per_group_quant_hip(
-        x,
-        quant_dtype=FP8_DTYPE,
-        group_size=group_size,
-        transpose_scale=False,
-        gemm_out_zero_init=Y,
+    k = x.shape[1]
+
+    # Check the tuned CSV to see if this (M,N,K) uses splitK>0.
+    # Only fuse the zero-init when splitK>0 (the GEMM needs a pre-zeroed Y
+    # for the atomic-add accumulation).  When splitK=0, skip the zero-fill
+    # to avoid ~6us of wasted work.
+    config = get_CKGEMM_config(
+        m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE
     )
-    return gemm_a8w8_blockscale(
-        x_q,
-        B,
-        x_scale,
-        Bs,
-        dtype=output_dtype,
-        out=Y,
-        y_is_zeroed=True,
-    )
+    needs_zero_init = config is not None and int(config.get("splitK", 0)) > 0
+
+    if needs_zero_init:
+        Y = torch.empty(m, n, dtype=output_dtype, device=x.device)
+        x_q, x_scale = per_group_quant_hip(
+            x,
+            quant_dtype=FP8_DTYPE,
+            group_size=group_size,
+            transpose_scale=False,
+            gemm_out_zero_init=Y,
+        )
+        return gemm_a8w8_blockscale(
+            x_q, B, x_scale, Bs, dtype=output_dtype, out=Y, y_is_zeroed=True
+        )
+    else:
+        x_q, x_scale = per_group_quant_hip(
+            x,
+            quant_dtype=FP8_DTYPE,
+            group_size=group_size,
+            transpose_scale=False,
+        )
+        return gemm_a8w8_blockscale(x_q, B, x_scale, Bs, dtype=output_dtype)
 
 
 def _rocm_aiter_fp8_blockscale_group_quant_gemm_fake(
