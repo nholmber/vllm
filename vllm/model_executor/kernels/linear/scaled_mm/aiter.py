@@ -282,6 +282,21 @@ class AiterFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             and rocm_aiter_ops.is_triton_gemm_w8a8_tuned(n, k)
         )
 
+        # Opt-in SplitK zero-init fusion (ROCm/aiter#3457): fold the GEMM
+        # output zero-init into the activation group-quant producer. Only the
+        # CK/CKTile blockscale path supports it, so it is disabled when the
+        # Triton GEMM is selected.
+        self.use_fused_zero_init = (
+            not self.use_triton
+            and rocm_aiter_ops.is_fp8_blockscale_fused_zero_init_enabled()
+        )
+        if self.use_fused_zero_init:
+            # The fused op quantizes the activation internally, so the base
+            # class must hand us the raw (unquantized) bf16 activation.
+            self.apply_input_quant = False  # type: ignore[misc]
+            act_group_shape = config.activation_quant_key.scale.group_shape
+            self.act_group_size = int(act_group_shape.col)
+
     @classmethod
     def is_supported(cls, compute_capability=None):
         return (
@@ -312,6 +327,22 @@ class AiterFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         As: torch.Tensor,
         Bs: torch.Tensor,
     ) -> torch.Tensor:
+        out_dtype = self.config.out_dtype
+
+        if self.use_fused_zero_init:
+            # ``A`` is the raw bf16 activation (apply_input_quant disabled);
+            # ``As`` is an unused placeholder. The fused op quantizes A and
+            # runs the blockscale GEMM with the producer-fused zero-init.
+            if Bs.dtype == torch.float8_e8m0fnu:
+                from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+                    _upcast_e8m0_to_fp32,
+                )
+
+                Bs = _upcast_e8m0_to_fp32(Bs).contiguous()
+            return rocm_aiter_ops.fp8_blockscale_group_quant_gemm(
+                A, B, Bs, self.act_group_size, output_dtype=out_dtype
+            )
+
         if As.dtype != Bs.dtype:
             from vllm.model_executor.layers.quantization.utils.fp8_utils import (
                 _upcast_e8m0_to_fp32,
@@ -327,7 +358,6 @@ class AiterFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             else:
                 Bs = Bs.to(torch.float32)
 
-        out_dtype = self.config.out_dtype
         if self.use_triton:
             gemm_a8w8_blockscale_op = rocm_aiter_ops.triton_gemm_a8w8_blockscale
         else:

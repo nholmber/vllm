@@ -674,6 +674,71 @@ def _rocm_aiter_gemm_a8w8_blockscale_impl(
     return gemm_a8w8_blockscale(A, B, As, Bs, dtype=output_dtype)
 
 
+def _rocm_aiter_fp8_blockscale_group_quant_gemm_impl(
+    x: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    group_size: int,
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Fused per-token group FP8 quant + a8w8 blockscale GEMM with the SplitK
+    zero-init fusion (ROCm/aiter#3457).
+
+    The GEMM output buffer ``Y`` is allocated here and pre-zeroed *inside* the
+    activation group-quant producer (``gemm_out_zero_init=Y``), so the blockscale
+    GEMM can run with ``y_is_zeroed=True`` and skip its own ``Y.zero_()`` launch.
+    Keeping ``Y`` private to this op (rather than threading a mutable buffer
+    across two custom ops) keeps the producer->GEMM ordering and aliasing safe
+    under torch.compile / CUDA graph capture.
+
+    The skip is only an actual win when the tuned CSV selects a SplitK
+    (KBatch > 1) kernel; otherwise it degenerates to the unfused result.
+
+    Args:
+        x: bf16 activations, shape (M, K).
+        B: FP8 weights, shape (N, K).
+        Bs: per-(128x128) weight scales (fp32).
+        group_size: activation quant group size (e.g. 128).
+        output_dtype: GEMM output dtype.
+    """
+    from aiter import gemm_a8w8_blockscale
+    from aiter.ops.quant import per_group_quant_hip
+
+    m = x.shape[0]
+    n = B.shape[0]
+    Y = torch.empty(m, n, dtype=output_dtype, device=x.device)
+    # transpose_scale=True matches the column-major x_scale layout the
+    # blockscale GEMM consumes; the producer zero-fills Y as a side effect.
+    x_q, x_scale = per_group_quant_hip(
+        x,
+        quant_dtype=FP8_DTYPE,
+        group_size=group_size,
+        transpose_scale=True,
+        gemm_out_zero_init=Y,
+    )
+    return gemm_a8w8_blockscale(
+        x_q,
+        B,
+        x_scale,
+        Bs,
+        dtype=output_dtype,
+        out=Y,
+        y_is_zeroed=True,
+    )
+
+
+def _rocm_aiter_fp8_blockscale_group_quant_gemm_fake(
+    x: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    group_size: int,
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    m = x.shape[0]
+    n = B.shape[0]
+    return torch.empty(m, n, dtype=output_dtype, device=x.device)
+
+
 def _rocm_aiter_gemm_a8w8_blockscale_fake(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -1456,6 +1521,13 @@ class rocm_aiter_ops:
     _FP4BMM_ENABLED = envs.VLLM_ROCM_USE_AITER_FP4BMM
     # TODO: Consolidate under _LINEAR_ENABLED
     _FP4_GEMM_DYNAMIC_QUANT_ASM = envs.VLLM_ROCM_USE_AITER_FP4_ASM_GEMM
+    # Opt-in: fuse the SplitK zero-init of the FP8 blockscale GEMM output into
+    # the activation group-quant producer (ROCm/aiter#3457). Lazily probed once
+    # for aiter API support, since older aiter builds lack the required args.
+    _FP8_BLOCKSCALE_FUSED_ZERO_INIT = (
+        envs.VLLM_ROCM_USE_AITER_FP8_BLOCKSCALE_FUSED_ZERO_INIT
+    )
+    _FP8_BLOCKSCALE_FUSED_ZERO_INIT_SUPPORTED: bool | None = None
     # TODO: Consolidate under VLLM_ROCM_USE_AITER_ROPE
     _TRITON_ROTARY_EMBED = envs.VLLM_ROCM_USE_AITER_TRITON_ROPE
     _MOE_SHARED_EXPERTS_ENABLED = envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
@@ -1487,6 +1559,10 @@ class rocm_aiter_ops:
         cls._FP8BMM_ENABLED = envs.VLLM_ROCM_USE_AITER_FP8BMM
         cls._FP4BMM_ENABLED = envs.VLLM_ROCM_USE_AITER_FP4BMM
         cls._FP4_GEMM_DYNAMIC_QUANT_ASM = envs.VLLM_ROCM_USE_AITER_FP4_ASM_GEMM
+        cls._FP8_BLOCKSCALE_FUSED_ZERO_INIT = (
+            envs.VLLM_ROCM_USE_AITER_FP8_BLOCKSCALE_FUSED_ZERO_INIT
+        )
+        cls._FP8_BLOCKSCALE_FUSED_ZERO_INIT_SUPPORTED = None
         cls._TRITON_ROTARY_EMBED = envs.VLLM_ROCM_USE_AITER_TRITON_ROPE
         cls._MOE_SHARED_EXPERTS_ENABLED = envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
         cls._TRITON_UNQUANT_GEMM = envs.VLLM_ROCM_USE_AITER_TRITON_GEMM
@@ -1569,6 +1645,46 @@ class rocm_aiter_ops:
     @if_aiter_supported
     def is_linear_fp8_enabled(cls) -> bool:
         return cls.is_linear_enabled()
+
+    @classmethod
+    @if_aiter_supported
+    def is_fp8_blockscale_fused_zero_init_enabled(cls) -> bool:
+        """Whether to fuse the FP8 blockscale SplitK zero-init into the
+        activation group-quant producer (ROCm/aiter#3457).
+
+        Requires the linear path to be enabled, the opt-in env flag to be set,
+        and an aiter build whose ``per_group_quant_hip`` /
+        ``gemm_a8w8_blockscale`` expose the ``gemm_out_zero_init`` /
+        ``y_is_zeroed`` arguments. The API support is probed once and cached so
+        older aiter builds silently fall back to the unfused path.
+        """
+        if not (cls.is_linear_enabled() and cls._FP8_BLOCKSCALE_FUSED_ZERO_INIT):
+            return False
+        if cls._FP8_BLOCKSCALE_FUSED_ZERO_INIT_SUPPORTED is None:
+            cls._FP8_BLOCKSCALE_FUSED_ZERO_INIT_SUPPORTED = (
+                cls._probe_fused_zero_init_support()
+            )
+        return cls._FP8_BLOCKSCALE_FUSED_ZERO_INIT_SUPPORTED
+
+    @staticmethod
+    def _probe_fused_zero_init_support() -> bool:
+        import inspect
+
+        try:
+            from aiter import gemm_a8w8_blockscale
+            from aiter.ops.quant import per_group_quant_hip
+        except Exception:
+            return False
+        try:
+            gemm_params = inspect.signature(gemm_a8w8_blockscale).parameters
+            quant_params = inspect.signature(per_group_quant_hip).parameters
+        except (TypeError, ValueError):
+            return False
+        return (
+            "out" in gemm_params
+            and "y_is_zeroed" in gemm_params
+            and "gemm_out_zero_init" in quant_params
+        )
 
     @classmethod
     @if_aiter_supported
@@ -1827,6 +1943,12 @@ class rocm_aiter_ops:
             )
 
             direct_register_custom_op(
+                op_name="rocm_aiter_fp8_blockscale_group_quant_gemm",
+                op_func=_rocm_aiter_fp8_blockscale_group_quant_gemm_impl,
+                fake_impl=_rocm_aiter_fp8_blockscale_group_quant_gemm_fake,
+            )
+
+            direct_register_custom_op(
                 op_name="rocm_aiter_rmsnorm_fused_dynamic_quant",
                 op_func=_rocm_aiter_rmsnorm_fused_dynamic_quant_impl,
                 fake_impl=_rocm_aiter_rmsnorm_fused_dynamic_quant_fake,
@@ -2062,6 +2184,21 @@ class rocm_aiter_ops:
     ) -> torch.Tensor:
         return torch.ops.vllm.rocm_aiter_gemm_a8w8_blockscale(
             A, B, As, Bs, output_dtype
+        )
+
+    @staticmethod
+    def fp8_blockscale_group_quant_gemm(
+        x: torch.Tensor,
+        B: torch.Tensor,
+        Bs: torch.Tensor,
+        group_size: int,
+        output_dtype: torch.dtype = torch.bfloat16,
+    ) -> torch.Tensor:
+        """Fused activation group-quant + FP8 blockscale GEMM with SplitK
+        zero-init fusion (ROCm/aiter#3457). ``x`` is the unquantized bf16
+        activation; quantization happens inside the op."""
+        return torch.ops.vllm.rocm_aiter_fp8_blockscale_group_quant_gemm(
+            x, B, Bs, group_size, output_dtype
         )
 
     @staticmethod

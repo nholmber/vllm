@@ -123,6 +123,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_TRITON_ROPE: bool = False
     VLLM_ROCM_USE_AITER_FP8BMM: bool = True
     VLLM_ROCM_USE_AITER_FP4BMM: bool = True
+    VLLM_ROCM_USE_AITER_FP8_BLOCKSCALE_FUSED_ZERO_INIT: bool = False
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: bool = False
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
@@ -1140,6 +1141,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_FP4BMM": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_FP4BMM", "True").lower() in ("true", "1")
+    ),
+    # Whether to fuse the SplitK zero-init of the FP8 a8w8 blockscale GEMM
+    # output into the upstream activation group-quant producer (aiter
+    # `gemm_out_zero_init` / `y_is_zeroed`). Requires an aiter build that
+    # exposes these args (ROCm/aiter#3457). Opt-in; by default disabled.
+    "VLLM_ROCM_USE_AITER_FP8_BLOCKSCALE_FUSED_ZERO_INIT": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_FP8_BLOCKSCALE_FUSED_ZERO_INIT", "False").lower()
+        in ("true", "1")
     ),
     # Use AITER triton unified attention for V1 attention
     "VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION": lambda: (
