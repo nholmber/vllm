@@ -302,11 +302,11 @@ class Qwen3_5Model(Qwen3NextModel):
             (f"experts.{base_layer}w13_weight", "experts.gate_up_proj", 0, "w1"),
             (f"experts.{base_layer}w2_weight", "experts.down_proj", 0, "w2"),
         ]
-        num_experts = (
+        num_routed = (
             self.config.num_experts if hasattr(self.config, "num_experts") else 0
         )
         is_fse = rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
-        num_routed = num_experts
+        num_experts = num_routed + (1 if is_fse else 0)
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -321,12 +321,17 @@ class Qwen3_5Model(Qwen3NextModel):
                 if name is None:
                     continue
 
-            # FSE: remap shared_expert weights to the fused expert slot
+            # FSE: remap shared_expert weights to the fused expert slot.
+            # Also reset expert_params_mapping for these weights since they
+            # have separate gate_proj/up_proj (not fused gate_up_proj like
+            # the routed experts), so they must use the non-fused mapping.
             if is_fse and "mlp.shared_expert." in name:
                 name = name.replace(
                     "mlp.shared_expert.",
                     f"mlp.experts.{num_routed}.",
                 )
+                is_fused_expert = False
+                expert_params_mapping = self.get_expert_mapping()
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if "experts.gate_up_proj" in name or "experts.down_proj" in name:
