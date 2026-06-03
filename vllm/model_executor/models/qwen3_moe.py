@@ -32,6 +32,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
@@ -195,15 +196,21 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 quant_config=None,
                 prefix=f"{prefix}.shared_expert_gate",
             )
-            self.shared_expert = Qwen3MoeMLP(
-                hidden_size=config.hidden_size,
-                intermediate_size=shared_expert_intermediate_size,
-                hidden_act=config.hidden_act,
-                quant_config=quant_config,
-                reduce_results=False,
-                expert_gate=self.shared_expert_gate,
-                prefix=f"{prefix}.shared_expert",
-            )
+            # When AITER FSE fusion is enabled, the shared expert is handled
+            # internally by FusedMoE (fused into routing as expert E+1).
+            # Don't create a standalone module — pass n_shared_experts=1 instead.
+            if rocm_aiter_ops.is_fusion_moe_shared_experts_enabled():
+                self.shared_expert = None
+            else:
+                self.shared_expert = Qwen3MoeMLP(
+                    hidden_size=config.hidden_size,
+                    intermediate_size=shared_expert_intermediate_size,
+                    hidden_act=config.hidden_act,
+                    quant_config=quant_config,
+                    reduce_results=False,
+                    expert_gate=self.shared_expert_gate,
+                    prefix=f"{prefix}.shared_expert",
+                )
         else:
             self.shared_expert_gate = None
             self.shared_expert = None
@@ -221,6 +228,12 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
             is_sequence_parallel=self.is_sequence_parallel,
+            n_shared_experts=1
+            if self.shared_expert is None and shared_expert_intermediate_size > 0
+            else None,
+            shared_expert_gate=self.shared_expert_gate
+            if self.shared_expert is None
+            else None,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
