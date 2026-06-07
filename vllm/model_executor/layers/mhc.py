@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import functools
+import os
+
 import torch
 
 # this import will also register the custom ops
@@ -9,6 +12,31 @@ from vllm.model_executor.custom_op import CustomOp
 from vllm.utils.import_utils import has_tilelang
 
 HAS_TILELANG = has_tilelang()
+
+
+@functools.lru_cache(maxsize=1)
+def _mhc_tilelang_is_broken() -> bool:
+    """Whether the tilelang MHC kernels are numerically unusable on this GPU.
+
+    The fused tilelang MHC ``pre``/``post``/``fused_post_pre`` kernels
+    miscompute the ``layer_input`` residual reduction on gfx942 (MI300X/
+    MI325X): they emit inf/NaN that corrupts the HC residual stream of every
+    decoder layer, producing incoherent output even though per-layer RMSNorm
+    masks the magnitude. On gfx942 we route these ops through the correct
+    (and cheap) torch reference instead.
+
+    Override with ``VLLM_DSV4_MHC_TORCH=1`` (force torch) / ``=0`` (force
+    tilelang) for benchmarking and once the kernel is fixed upstream.
+    """
+    override = os.environ.get("VLLM_DSV4_MHC_TORCH")
+    if override is not None:
+        return override == "1"
+    try:
+        from vllm.platforms.rocm import on_gfx942
+
+        return on_gfx942()
+    except Exception:
+        return False
 
 
 # --8<-- [start:mhc_pre]
@@ -89,7 +117,7 @@ class MHCPreOp(CustomOp):
         #         sinkhorn_repeat,
         #     )
         # else:
-        if HAS_TILELANG:
+        if HAS_TILELANG and not _mhc_tilelang_is_broken():
             return torch.ops.vllm.mhc_pre_tilelang(
                 residual,
                 fn,
@@ -194,7 +222,7 @@ class MHCPostOp(CustomOp):
         #         comb_res_mix,
         #     )
         # else:
-        if HAS_TILELANG:
+        if HAS_TILELANG and not _mhc_tilelang_is_broken():
             return torch.ops.vllm.mhc_post_tilelang(
                 x, residual, post_layer_mix, comb_res_mix
             )
@@ -266,7 +294,7 @@ class HCHeadOp(CustomOp):
         outer_shape = hidden_states.shape[:-2]
         hs_flat = hidden_states.view(-1, hc_mult, hidden_size)
 
-        if HAS_TILELANG:
+        if HAS_TILELANG and not _mhc_tilelang_is_broken():
             out = torch.ops.vllm.hc_head_fused_kernel_tilelang(
                 hs_flat,
                 hc_fn,
@@ -373,7 +401,26 @@ class MHCFusedPostPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        return torch.ops.vllm.mhc_fused_post_pre_tilelang(
+        if HAS_TILELANG and not _mhc_tilelang_is_broken():
+            return torch.ops.vllm.mhc_fused_post_pre_tilelang(
+                x,
+                residual,
+                post_layer_mix,
+                comb_res_mix,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+                tile_n,
+                norm_weight,
+                norm_eps,
+            )
+        return self.forward_native(
             x,
             residual,
             post_layer_mix,
@@ -392,7 +439,41 @@ class MHCFusedPostPreOp(CustomOp):
             norm_eps,
         )
 
-    def forward_native(self, *args, **kwargs):
-        raise NotImplementedError(
-            "Native implementation of mhc_fused_post_pre is not available"
+    def forward_native(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post_layer_mix: torch.Tensor,
+        comb_res_mix: torch.Tensor,
+        fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        rms_eps: float,
+        hc_pre_eps: float,
+        hc_sinkhorn_eps: float,
+        hc_post_mult_value: float,
+        sinkhorn_repeat: int,
+        n_splits: int = 1,
+        tile_n: int = 1,
+        norm_weight: torch.Tensor | None = None,
+        norm_eps: float = 0.0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # The fused tilelang kernel is equivalent to MHCPostOp followed by
+        # MHCPreOp on the updated residual streams. Decompose into the two
+        # correct torch reductions; this is what restores coherent output on
+        # gfx942 where the fused kernel emits inf/NaN.
+        new_residual = mhc_kernels.mhc_post_torch(
+            x, residual, post_layer_mix, comb_res_mix
         )
+        post_mix, comb_mix, layer_input = mhc_kernels.mhc_pre_torch(
+            new_residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+        )
+        return new_residual, post_mix, comb_mix, layer_input
