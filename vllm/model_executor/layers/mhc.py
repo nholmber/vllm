@@ -39,6 +39,40 @@ def _mhc_tilelang_is_broken() -> bool:
         return False
 
 
+@functools.lru_cache(maxsize=1)
+def _mhc_aiter_enabled() -> bool:
+    """Whether to use the AITER MHC kernels on this ROCm GPU.
+
+    The AITER ``mhc_pre``/``mhc_post`` HIP kernels are both correct and the
+    fastest path on gfx942 (MI300X/MI325X), but only once the aiter build
+    includes the MHC accuracy fixes:
+
+    * ROCm/aiter#3033 (sqrsum store race in ``mhc_pre_gemm_sqrsum_kernel``)
+    * ROCm/aiter#3417 (``mhc_pre_big_fuse`` RMS-reduction lane participation)
+
+    Without #3417 the fused big-fuse reduction drops lanes from the warp
+    ``shfl`` reduction and miscomputes ``layer_input`` for >1 token, which
+    corrupts the HC residual stream (gibberish output, GSM8K collapse). The
+    individual ops still assert ``hidden_size % 256 == 0`` at the call site.
+
+    Defaults to enabled on ROCm. Override with ``VLLM_DSV4_MHC_AITER=1``
+    (force aiter) / ``=0`` (disable, fall back to tilelang/torch).
+    """
+    override = os.environ.get("VLLM_DSV4_MHC_AITER")
+    if override is not None:
+        return override == "1"
+    try:
+        from vllm.platforms import current_platform
+
+        if not current_platform.is_rocm():
+            return False
+        from vllm._aiter_ops import rocm_aiter_ops  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
 # --8<-- [start:mhc_pre]
 @CustomOp.register("mhc_pre")
 class MHCPreOp(CustomOp):
@@ -99,24 +133,21 @@ class MHCPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # TODO: Reenable aiter after we are at the aiter
-        # version that has this bugfix
-        # https://github.com/ROCm/aiter/commit/b639cb63bcac4672dce33a731fad042a65cb3649
-        # It has accuracy problem at large number of tokens.
-        # hidden_size = residual.shape[-1]
-        # if hidden_size % 256 == 0:
-        #     return torch.ops.vllm.mhc_pre_aiter(
-        #         residual,
-        #         fn,
-        #         hc_scale,
-        #         hc_base,
-        #         rms_eps,
-        #         hc_pre_eps,
-        #         hc_sinkhorn_eps,
-        #         hc_post_mult_value,
-        #         sinkhorn_repeat,
-        #     )
-        # else:
+        # Prefer the AITER HIP kernel: correct and fastest on gfx942 once the
+        # aiter build includes ROCm/aiter#3033 + #3417 (see _mhc_aiter_enabled).
+        hidden_size = residual.shape[-1]
+        if _mhc_aiter_enabled() and hidden_size % 256 == 0:
+            return torch.ops.vllm.mhc_pre_aiter(
+                residual,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+            )
         if HAS_TILELANG and not _mhc_tilelang_is_broken():
             return torch.ops.vllm.mhc_pre_tilelang(
                 residual,
@@ -209,19 +240,16 @@ class MHCPostOp(CustomOp):
         post_layer_mix: torch.Tensor,
         comb_res_mix: torch.Tensor,
     ) -> torch.Tensor:
-        # TODO: Reenable aiter after we are at the aiter
-        # version that has this bugfix
-        # https://github.com/ROCm/aiter/commit/b639cb63bcac4672dce33a731fad042a65cb3649
-        # It has accuracy problem at large number of tokens.
-        # hidden_size = residual.shape[-1]
-        # if hidden_size % 256 == 0:
-        #     return torch.ops.vllm.mhc_post_aiter(
-        #         x,
-        #         residual,
-        #         post_layer_mix,
-        #         comb_res_mix,
-        #     )
-        # else:
+        # Prefer the AITER HIP kernel (correct + fastest on gfx942 with the
+        # required aiter MHC fixes; see _mhc_aiter_enabled).
+        hidden_size = residual.shape[-1]
+        if _mhc_aiter_enabled() and hidden_size % 256 == 0:
+            return torch.ops.vllm.mhc_post_aiter(
+                x,
+                residual,
+                post_layer_mix,
+                comb_res_mix,
+            )
         if HAS_TILELANG and not _mhc_tilelang_is_broken():
             return torch.ops.vllm.mhc_post_tilelang(
                 x, residual, post_layer_mix, comb_res_mix
@@ -401,6 +429,28 @@ class MHCFusedPostPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # AITER has no fused post+pre kernel; compose the two correct AITER
+        # ops, which is still the fastest correct path on gfx942.
+        hidden_size = residual.shape[-1]
+        if _mhc_aiter_enabled() and hidden_size % 256 == 0:
+            new_residual = torch.ops.vllm.mhc_post_aiter(
+                x,
+                residual,
+                post_layer_mix,
+                comb_res_mix,
+            )
+            post_mix, comb_mix, layer_input = torch.ops.vllm.mhc_pre_aiter(
+                new_residual,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+            )
+            return new_residual, post_mix, comb_mix, layer_input
         if HAS_TILELANG and not _mhc_tilelang_is_broken():
             return torch.ops.vllm.mhc_fused_post_pre_tilelang(
                 x,
