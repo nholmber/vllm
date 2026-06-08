@@ -1,57 +1,67 @@
-# DeepSeek-V4 MHC on AMD gfx942 (MI300X) — fix handover
+# DeepSeek-V4 MHC fix on AMD gfx942 (MI300X) — handover
 
-Self-contained. Everything you need is in this folder + this vLLM branch
-(`fix/dsv4-mhc-gfx942`). No external repos required.
+**Problem:** DSv4 produced gibberish on gfx942 (GSM8K ~1%). The MHC layer miscomputed the HC
+residual stream.
 
-## Problem
-On gfx942, DeepSeek-V4 emitted gibberish (GSM8K ~1%). The MHC (hyper-connection)
-layer was miscomputing the HC residual stream. Two independent kernel families
-were affected:
-- **tilelang** fused MHC kernels: wrong at *every* token count (32-lane-warp
-  assumption on a 64-lane wavefront). Not used.
-- **aiter** MHC kernels: correct at 1 token but wrong for ≥4 tokens because the
-  shipped aiter build was missing an accuracy fix (details below).
+**Root cause:** The shipped aiter build was missing `ROCm/aiter #3417` (`mhc_pre_big_fuse`
+accuracy). Its RMS-reduction guard let out-of-range lanes skip the reduction block, dropping them
+from the warp shfl reduction → corrupted `layer_input` for any >1-token input. (The earlier `#3033`
+sqrsum-race fix alone wasn't enough — `mhc_pre` runs big_fuse after the sqrsum step.) The separate
+tilelang MHC kernels are *also* broken (64- vs 32-lane wavefront assumption) and are not used.
 
-## Root cause of the aiter miscompute
-The deployed aiter build was missing **ROCm/aiter #3417** ("Fix mhc_pre_big_fuse
-accuracy"). In `mhc_pre_big_fuse`, the RMS-reduction guard let out-of-range lanes
-skip the whole reduction block, so they dropped out of the warp `shfl` reduction
-and corrupted `layer_input` for any >1-token input. (`mhc_pre` runs `big_fuse`
-after the sqrsum step, so the earlier #3033 sqrsum-race fix alone was not enough.)
+**Fix:** Use aiter MHC kernels built with **both #3033 + #3417**, and wire vLLM to prefer them on
+ROCm. Two files:
+- corrected `mhc_kernels.cu` → aiter source (+ drop cached `module_mhc.so` so it rebuilds)
+- wired `mhc.py` → `_mhc_aiter_enabled()` gate; routes MHCPre/Post/FusedPostPre through aiter
+  (needs `hidden_size % 256 == 0`, DSv4-Flash=7168 OK)
 
-The corrected kernel source is `aiter_mhc_kernels.cu` here (= upstream `main`,
-includes both #3033 and #3417). The one-logical-line fix appears twice:
-
-```cpp
-// BROKEN:
-if(warp_id < hc_mult3_reduce_warp_num && lane_id < warp_num_pow2 * num_rows) {
-    float sum = s_pre_rms_partial[lane_id];
-    if (lane_id % warp_num_pow2 >= warp_num) { sum = 0.0f; }
-// FIXED:
-if(warp_id < hc_mult3_reduce_warp_num) {
-    float sum = 0.0f;
-    if(lane_id < warp_num_pow2 * num_rows && lane_id % warp_num_pow2 < warp_num) {
-        sum = s_pre_rms_partial[lane_id];
-    }
+## aiter vs tilelang — correctness
+`mhc_pre` `layer_input` max rel-err vs torch (ground truth):
 ```
-
-## The fix (two files)
-1. `aiter_mhc_kernels.cu` → `…/aiter_meta/csrc/kernels/mhc_kernels.cu` (then drop
-   the cached `…/aiter/jit/module_mhc.so` so it rebuilds).
-2. `mhc.py` → `…/vllm/model_executor/layers/mhc.py` (identical to this branch's
-   `vllm/model_executor/layers/mhc.py`). Adds `_mhc_aiter_enabled()` and routes
-   `MHCPreOp`/`MHCPostOp`/`MHCFusedPostPreOp` through the aiter ops on ROCm.
-
-## Build the baked image
-```bash
-# from this folder; BASE = your working DSv4 ROCm image
-docker build -t vllm-rocm:dsv4-mhc-aiter-fixed \
-  --build-arg BASE=<your-dsv4-rocm-image> .
+T      aiter(#3033+#3417)   tilelang
+1      6.5e-08  OK           ~1.0    BROKEN
+4      8.0e-05  OK           0.94    BROKEN
+16     2.9e-03  OK           ~1-2.4  BROKEN
+64     1.1e-03  OK           ~1-1.9  BROKEN
+256    1.9e-03  OK           1.25    BROKEN
+1024   1.4e-03  OK           ~1-1.9  BROKEN
 ```
-A prebuilt image is already on this host: **`vllm-rocm:dsv4-mhc-aiter-fixed`**.
+aiter = bf16-accurate everywhere → GSM8K 95.6%. tilelang = order-1 wrong at every T (incl T=1) →
+GSM8K 1.29% (gibberish). tilelang's bug is structural: launches `threads=96`, guards reductions with
+`if tid < 32:` (32-lane NVIDIA-warp assumption); on gfx942's 64-lane wavefront that's half a wave and
+the in-`if` `sync_threads()` is unsafe.
 
-## Run
-```bash
+## Throughput (1k/1k, compile mode, tok/s)
+tilelang numbers are produced while emitting garbage; torch-fix is the correct-but-slow baseline:
+```
+conc   tilelang(broken)   torch-fix   aiter     aiter vs torch-fix
+4      110.28             59.65       118.94    +99%
+8      224.62             118.64      229.08    +93%
+16     428.66             224.41      434.99    +94%
+32     833.83             408.10      781.75    +91%
+```
+GSM8K: broken 1.29% | torch-fix 95.38% | **aiter 95.6%**.
+TPOT @ conc32 (ms): tilelang 37 | torch-fix 77 | **aiter 40**.
+
+aiter is correct **and** ~2× the torch fallback (recovers the ~46–51% penalty), matching the
+fast-but-broken tilelang up to conc 16 and only ~6% behind at conc 32. The conc-32 gap is because
+tilelang has one fused `mhc_fused_post_pre` kernel while aiter composes `mhc_post`→`mhc_pre`
+(one extra launch + HBM round-trip). **aiter supersedes the torch fallback; tilelang stays unused.**
+
+## Where everything is (self-contained in the vLLM fork — no other repo needed)
+- `nholmber/vllm` @ `fix/dsv4-mhc-gfx942`
+- code: `vllm/model_executor/layers/mhc.py`
+- bundle: `dsv4_mhc_gfx942/` → `HANDOVER.md`, `aiter_mhc_kernels.cu`, `mhc.py`, `Dockerfile`, `verify_numerics.py`
+- commits: `7b118688d` (torch fallback) → `b795ba16d` (enable aiter) → `1102d07b1` (handover + bake)
+
+## Build / run
+Prebuilt image on the host: **`vllm-rocm:dsv4-mhc-aiter-fixed`** (aiter prebuilt, ready to run).
+Or rebuild from the bundle against your own DSv4 base image:
+```
+docker build -t vllm-rocm:dsv4-mhc-aiter-fixed --build-arg BASE=<your-dsv4-image> dsv4_mhc_gfx942/
+```
+Serve (TP4, port 8001):
+```
 docker run -d --name dsv4 \
   --device=/dev/kfd --device=/dev/dri --group-add video --group-add render \
   --security-opt seccomp=unconfined --ipc=host -e HIP_VISIBLE_DEVICES=0,1,2,3 \
@@ -63,24 +73,20 @@ docker run -d --name dsv4 \
   --gpu-memory-utilization 0.85 --distributed-executor-backend mp \
   --max-num-batched-tokens 8192 --host 0.0.0.0 --port 8001
 ```
-First start triggers a one-time ~30s aiter `module_mhc` JIT build (the
-from-scratch image only; the prebuilt image already contains it).
 
-## Runtime switches (env)
+## Runtime switches
 - `VLLM_DSV4_MHC_AITER=1|0` — force / disable aiter MHC (default: on for ROCm).
 - `VLLM_DSV4_MHC_TORCH=1|0` — force torch (correct, slow) / tilelang (broken).
-- aiter ops require `hidden_size % 256 == 0` (DSv4-Flash = 7168, OK); otherwise
-  it falls back automatically.
 
 ## Verify
-```bash
+```
 # numerics (no model load): expect aiter_rel ~1e-3, all finite
 docker run --rm --entrypoint bash \
   --device=/dev/kfd --device=/dev/dri --group-add video --group-add render \
   --security-opt seccomp=unconfined -e HIP_VISIBLE_DEVICES=0 \
-  -v "$PWD":/h:ro vllm-rocm:dsv4-mhc-aiter-fixed -lc 'python3 /h/verify_numerics.py'
+  -v "$PWD/dsv4_mhc_gfx942":/h:ro vllm-rocm:dsv4-mhc-aiter-fixed -lc 'python3 /h/verify_numerics.py'
 
-# correctness (server up): expect ~0.95
+# GSM8K (expect ~0.95)
 lm_eval --model local-completions \
   --model_args model=deepseek-ai/DeepSeek-V4-Flash,base_url=http://<host>:8001/v1/completions,num_concurrent=32,tokenized_requests=False,trust_remote_code=True,tokenizer=deepseek-ai/DeepSeek-V4-Flash \
   --tasks gsm8k --num_fewshot 5 --batch_size 32
@@ -92,25 +98,7 @@ vllm bench serve --backend vllm --base-url http://<host>:8001 \
   --num-prompts $((3*C)) --max-concurrency $C --ignore-eos --seed 0
 ```
 
-## Validation results (DSv4-Flash, TP4, MI300X, compile mode)
-| metric | broken (tilelang) | torch fallback | **aiter (this fix)** |
-|---|---|---|---|
-| GSM8K | 1.29% | 95.38% | **95.6%** |
-| throughput @ conc 32 | 833 tok/s (gibberish) | 408 tok/s | **782 tok/s** |
-| TPOT @ conc 32 | 37 ms | 77 ms | **40 ms** |
-
-aiter is correct **and** ~2× the torch fallback (recovers the ~46–51% penalty),
-matching the fast-but-broken tilelang path.
-
-## Files here
-- `aiter_mhc_kernels.cu` — corrected aiter MHC kernel source (#3033 + #3417).
-- `mhc.py` — wired vLLM MHC dispatch (copy of this branch's layer file).
-- `Dockerfile` — self-contained bake from a DSv4 base image.
-- `verify_numerics.py` — aiter-vs-torch micro check.
-
-## Upstreaming / follow-ups
-- The vLLM change is ready to upstream (re-enables the aiter blocks the original
-  PR left commented). Long term, bump the aiter dependency to a version that
-  already includes #3417 instead of patching `mhc_kernels.cu`.
-- Optional: fix the tilelang kernel to be wavefront-size aware (lower priority —
-  aiter already gives correct + fast).
+## Open item
+Bump the aiter dependency to a release that already includes #3417 (so no `mhc_kernels.cu` patch is
+needed) — then the `mhc.py` change is upstreamable as-is. Optional/low priority: make the tilelang
+kernel wavefront-size aware (higher effort, no advantage over aiter).
