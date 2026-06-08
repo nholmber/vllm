@@ -1,0 +1,529 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import functools
+import os
+
+import torch
+
+# this import will also register the custom ops
+# import vllm.model_executor.kernels.mhc  # noqa: F401
+import vllm.model_executor.kernels.mhc as mhc_kernels
+from vllm.model_executor.custom_op import CustomOp
+from vllm.utils.import_utils import has_tilelang
+
+HAS_TILELANG = has_tilelang()
+
+
+@functools.lru_cache(maxsize=1)
+def _mhc_tilelang_is_broken() -> bool:
+    """Whether the tilelang MHC kernels are numerically unusable on this GPU.
+
+    The fused tilelang MHC ``pre``/``post``/``fused_post_pre`` kernels
+    miscompute the ``layer_input`` residual reduction on gfx942 (MI300X/
+    MI325X): they emit inf/NaN that corrupts the HC residual stream of every
+    decoder layer, producing incoherent output even though per-layer RMSNorm
+    masks the magnitude. On gfx942 we route these ops through the correct
+    (and cheap) torch reference instead.
+
+    Override with ``VLLM_DSV4_MHC_TORCH=1`` (force torch) / ``=0`` (force
+    tilelang) for benchmarking and once the kernel is fixed upstream.
+    """
+    override = os.environ.get("VLLM_DSV4_MHC_TORCH")
+    if override is not None:
+        return override == "1"
+    try:
+        from vllm.platforms.rocm import on_gfx942
+
+        return on_gfx942()
+    except Exception:
+        return False
+
+
+@functools.lru_cache(maxsize=1)
+def _mhc_aiter_enabled() -> bool:
+    """Whether to use the AITER MHC kernels on this ROCm GPU.
+
+    The AITER ``mhc_pre``/``mhc_post`` HIP kernels are both correct and the
+    fastest path on gfx942 (MI300X/MI325X), but only once the aiter build
+    includes the MHC accuracy fixes:
+
+    * ROCm/aiter#3033 (sqrsum store race in ``mhc_pre_gemm_sqrsum_kernel``)
+    * ROCm/aiter#3417 (``mhc_pre_big_fuse`` RMS-reduction lane participation)
+
+    Without #3417 the fused big-fuse reduction drops lanes from the warp
+    ``shfl`` reduction and miscomputes ``layer_input`` for >1 token, which
+    corrupts the HC residual stream (gibberish output, GSM8K collapse). The
+    individual ops still assert ``hidden_size % 256 == 0`` at the call site.
+
+    Defaults to enabled on ROCm. Override with ``VLLM_DSV4_MHC_AITER=1``
+    (force aiter) / ``=0`` (disable, fall back to tilelang/torch).
+    """
+    override = os.environ.get("VLLM_DSV4_MHC_AITER")
+    if override is not None:
+        return override == "1"
+    try:
+        from vllm.platforms import current_platform
+
+        if not current_platform.is_rocm():
+            return False
+        from vllm._aiter_ops import rocm_aiter_ops  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+# --8<-- [start:mhc_pre]
+@CustomOp.register("mhc_pre")
+class MHCPreOp(CustomOp):
+    """MHC pre block.
+
+    Computes mix logits from RMS-normalized HC residual streams, then
+    returns post_mix, comb_mix, and
+    layer_input = sum_i pre_mix_i * residual_i.
+    """
+
+    # --8<-- [end:mhc_pre]
+    @classmethod
+    def enabled(cls) -> bool:
+        return True
+
+    def forward_cuda(
+        self,
+        residual: torch.Tensor,
+        fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        rms_eps: float,
+        hc_pre_eps: float,
+        hc_sinkhorn_eps: float,
+        hc_post_mult_value: float,
+        sinkhorn_repeat: int,
+        n_splits: int = 1,
+        norm_weight: torch.Tensor | None = None,
+        norm_eps: float = 0.0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return torch.ops.vllm.mhc_pre_tilelang(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            n_splits,
+            norm_weight,
+            norm_eps,
+        )
+
+    def forward_hip(
+        self,
+        residual: torch.Tensor,
+        fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        rms_eps: float,
+        hc_pre_eps: float,
+        hc_sinkhorn_eps: float,
+        hc_post_mult_value: float,
+        sinkhorn_repeat: int,
+        n_splits: int = 1,
+        norm_weight: torch.Tensor | None = None,
+        norm_eps: float = 0.0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Prefer the AITER HIP kernel: correct and fastest on gfx942 once the
+        # aiter build includes ROCm/aiter#3033 + #3417 (see _mhc_aiter_enabled).
+        hidden_size = residual.shape[-1]
+        if _mhc_aiter_enabled() and hidden_size % 256 == 0:
+            return torch.ops.vllm.mhc_pre_aiter(
+                residual,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+            )
+        if HAS_TILELANG and not _mhc_tilelang_is_broken():
+            return torch.ops.vllm.mhc_pre_tilelang(
+                residual,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+                norm_weight,
+                norm_eps,
+            )
+        else:
+            return self.forward_native(
+                residual,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+                norm_weight,
+                norm_eps,
+            )
+
+    def forward_native(
+        self,
+        residual: torch.Tensor,
+        fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        rms_eps: float,
+        hc_pre_eps: float,
+        hc_sinkhorn_eps: float,
+        hc_post_mult_value: float,
+        sinkhorn_repeat: int,
+        n_splits: int = 1,
+        norm_weight: torch.Tensor | None = None,
+        norm_eps: float = 0.0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return mhc_kernels.mhc_pre_torch(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+        )
+
+
+# --8<-- [start:mhc_post]
+@CustomOp.register("mhc_post")
+class MHCPostOp(CustomOp):
+    """MHC post block.
+
+    Combines the layer output with the HC residual streams:
+    out_j = post_layer_mix_j * x + sum_i comb_res_mix_ij * residual_i.
+    """
+
+    # --8<-- [end:mhc_post]
+
+    @classmethod
+    def enabled(cls) -> bool:
+        return True
+
+    def forward_cuda(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post_layer_mix: torch.Tensor,
+        comb_res_mix: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.ops.vllm.mhc_post_tilelang(
+            x, residual, post_layer_mix, comb_res_mix
+        )
+
+    def forward_hip(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post_layer_mix: torch.Tensor,
+        comb_res_mix: torch.Tensor,
+    ) -> torch.Tensor:
+        # Prefer the AITER HIP kernel (correct + fastest on gfx942 with the
+        # required aiter MHC fixes; see _mhc_aiter_enabled).
+        hidden_size = residual.shape[-1]
+        if _mhc_aiter_enabled() and hidden_size % 256 == 0:
+            return torch.ops.vllm.mhc_post_aiter(
+                x,
+                residual,
+                post_layer_mix,
+                comb_res_mix,
+            )
+        if HAS_TILELANG and not _mhc_tilelang_is_broken():
+            return torch.ops.vllm.mhc_post_tilelang(
+                x, residual, post_layer_mix, comb_res_mix
+            )
+        else:
+            return self.forward_native(x, residual, post_layer_mix, comb_res_mix)
+
+    def forward_native(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post_layer_mix: torch.Tensor,
+        comb_res_mix: torch.Tensor,
+    ) -> torch.Tensor:
+        return mhc_kernels.mhc_post_torch(
+            x,
+            residual,
+            post_layer_mix,
+            comb_res_mix,
+        )
+
+
+# --8<-- [start:hc_head]
+@CustomOp.register("hc_head")
+class HCHeadOp(CustomOp):
+    """HC head reduction for DeepSeek V4.
+
+    Computes gates from the RMS-normalized flattened HC residual and
+    returns out = sum_i gate_i * residual_i, collapsing hc_mult streams
+    to one.
+    """
+
+    # --8<-- [end:hc_head]
+    @classmethod
+    def enabled(cls) -> bool:
+        return True
+
+    def forward_cuda(
+        self,
+        hidden_states: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        rms_norm_eps: float,
+        hc_eps: float,
+    ) -> torch.Tensor:
+        hc_mult, hidden_size = hidden_states.shape[-2:]
+        outer_shape = hidden_states.shape[:-2]
+        hs_flat = hidden_states.view(-1, hc_mult, hidden_size)
+        out = torch.ops.vllm.hc_head_fused_kernel_tilelang(
+            hs_flat,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            rms_norm_eps,
+            hc_eps,
+        )
+        return out.view(*outer_shape, hidden_size)
+
+    def forward_hip(
+        self,
+        hidden_states: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        rms_norm_eps: float,
+        hc_eps: float,
+    ) -> torch.Tensor:
+        hc_mult, hidden_size = hidden_states.shape[-2:]
+        outer_shape = hidden_states.shape[:-2]
+        hs_flat = hidden_states.view(-1, hc_mult, hidden_size)
+
+        if HAS_TILELANG and not _mhc_tilelang_is_broken():
+            out = torch.ops.vllm.hc_head_fused_kernel_tilelang(
+                hs_flat,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                rms_norm_eps,
+                hc_eps,
+            )
+        else:
+            num_tokens = hs_flat.shape[0]
+            out = torch.empty(
+                num_tokens,
+                hidden_size,
+                dtype=torch.bfloat16,
+                device=hidden_states.device,
+            )
+            torch.ops.vllm.hc_head_triton(
+                hs_flat,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                out,
+                hidden_size,
+                rms_norm_eps,
+                hc_eps,
+                hc_mult,
+            )
+
+        return out.view(*outer_shape, hidden_size)
+
+    def forward_native(self, *args, **kwargs):
+        raise NotImplementedError("Native implementation of hc_head is not available")
+
+
+# --8<-- [start:mhc_fused_post_pre]
+@CustomOp.register("mhc_fused_post_pre")
+class MHCFusedPostPreOp(CustomOp):
+    """Fused MHC post block followed by the next MHC pre block.
+
+    Equivalent to applying MHCPostOp and then MHCPreOp to the updated
+    residual streams, returning residual_cur, post_mix_cur, comb_mix_cur,
+    and layer_input_cur.
+    """
+
+    # --8<-- [end:mhc_fused_post_pre]
+    @classmethod
+    def enabled(cls) -> bool:
+        return True
+
+    def forward_cuda(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post_layer_mix: torch.Tensor,
+        comb_res_mix: torch.Tensor,
+        fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        rms_eps: float,
+        hc_pre_eps: float,
+        hc_sinkhorn_eps: float,
+        hc_post_mult_value: float,
+        sinkhorn_repeat: int,
+        n_splits: int = 1,
+        tile_n: int = 1,
+        norm_weight: torch.Tensor | None = None,
+        norm_eps: float = 0.0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return torch.ops.vllm.mhc_fused_post_pre_tilelang(
+            x,
+            residual,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            n_splits,
+            tile_n,
+            norm_weight,
+            norm_eps,
+        )
+
+    def forward_hip(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post_layer_mix: torch.Tensor,
+        comb_res_mix: torch.Tensor,
+        fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        rms_eps: float,
+        hc_pre_eps: float,
+        hc_sinkhorn_eps: float,
+        hc_post_mult_value: float,
+        sinkhorn_repeat: int,
+        n_splits: int = 1,
+        tile_n: int = 1,
+        norm_weight: torch.Tensor | None = None,
+        norm_eps: float = 0.0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # AITER has no fused post+pre kernel; compose the two correct AITER
+        # ops, which is still the fastest correct path on gfx942.
+        hidden_size = residual.shape[-1]
+        if _mhc_aiter_enabled() and hidden_size % 256 == 0:
+            new_residual = torch.ops.vllm.mhc_post_aiter(
+                x,
+                residual,
+                post_layer_mix,
+                comb_res_mix,
+            )
+            post_mix, comb_mix, layer_input = torch.ops.vllm.mhc_pre_aiter(
+                new_residual,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+            )
+            return new_residual, post_mix, comb_mix, layer_input
+        if HAS_TILELANG and not _mhc_tilelang_is_broken():
+            return torch.ops.vllm.mhc_fused_post_pre_tilelang(
+                x,
+                residual,
+                post_layer_mix,
+                comb_res_mix,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+                tile_n,
+                norm_weight,
+                norm_eps,
+            )
+        return self.forward_native(
+            x,
+            residual,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            n_splits,
+            tile_n,
+            norm_weight,
+            norm_eps,
+        )
+
+    def forward_native(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post_layer_mix: torch.Tensor,
+        comb_res_mix: torch.Tensor,
+        fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        rms_eps: float,
+        hc_pre_eps: float,
+        hc_sinkhorn_eps: float,
+        hc_post_mult_value: float,
+        sinkhorn_repeat: int,
+        n_splits: int = 1,
+        tile_n: int = 1,
+        norm_weight: torch.Tensor | None = None,
+        norm_eps: float = 0.0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # The fused tilelang kernel is equivalent to MHCPostOp followed by
+        # MHCPreOp on the updated residual streams. Decompose into the two
+        # correct torch reductions; this is what restores coherent output on
+        # gfx942 where the fused kernel emits inf/NaN.
+        new_residual = mhc_kernels.mhc_post_torch(
+            x, residual, post_layer_mix, comb_res_mix
+        )
+        post_mix, comb_mix, layer_input = mhc_kernels.mhc_pre_torch(
+            new_residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+        )
+        return new_residual, post_mix, comb_mix, layer_input
