@@ -78,15 +78,19 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             config.hidden_size,
         )
 
-        # Workaround: mtp.fc is stored as BF16 in NVFP4 checkpoints but is
-        # missing from hf_quant_config.json exclude_modules. Force unquantized.
+        # MTP weights are stored unquantized (BF16/FP32) in both NVFP4 and
+        # MXFP4 (Quark) checkpoints — all mtp.* layers appear in the quant
+        # config exclude list. Clear quant_config so that Linear and FusedMoE
+        # layers allocate unquantized parameters with correct shapes.
         # Ref: https://github.com/vllm-project/vllm/pull/38650
         # Ref: https://github.com/NVIDIA/Model-Optimizer/pull/1124
-        fc_quant = (
-            None
-            if (quant_config and quant_config.get_name() == "modelopt_fp4")
-            else quant_config
+        # Ref: https://github.com/sgl-project/sglang/pull/23146
+        _is_fp4 = quant_config is not None and quant_config.get_name() in (
+            "modelopt_fp4",
+            "quark",
         )
+        fc_quant = None if _is_fp4 else quant_config
+
         self.fc = ColumnParallelLinear(
             self.config.hidden_size * 2,
             self.config.hidden_size,
@@ -97,6 +101,14 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             prefix=f"{prefix}.fc",
         )
 
+        # Temporarily clear quant_config on vllm_config so decoder layers
+        # create unquantized parameters. dataclasses.replace does not work
+        # here because VllmConfig.__post_init__ re-derives quant_config
+        # from model_config.
+        _saved_quant = vllm_config.quant_config
+        if _is_fp4:
+            object.__setattr__(vllm_config, "quant_config", None)
+
         self.layers = torch.nn.ModuleList(
             Qwen3_5DecoderLayer(
                 vllm_config,
@@ -105,6 +117,9 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             )
             for idx in range(self.num_mtp_layers)
         )
+
+        if _is_fp4:
+            object.__setattr__(vllm_config, "quant_config", _saved_quant)
 
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
