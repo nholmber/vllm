@@ -817,6 +817,28 @@ class AiterFlashAttentionImpl(AttentionImpl):
         assert self.num_heads % self.num_kv_heads == 0
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
 
+        # Enable dynamic FP8 quantization for FMHA on gfx950 with hd256.
+        # VLLM_ROCM_FP8_FMHA: "0" = off, "1" = force on, "auto" = auto-detect
+        import os as _os
+
+        _fp8_fmha_env = _os.environ.get("VLLM_ROCM_FP8_FMHA", "auto")
+        if _fp8_fmha_env == "0":
+            self.use_fp8_fmha = False
+        elif _fp8_fmha_env == "1":
+            self.use_fp8_fmha = True
+        else:
+            self.use_fp8_fmha = (
+                head_size == 256
+                and current_platform.is_rocm()
+                and current_platform.get_device_capability()
+                == DeviceCapability(major=9, minor=5)
+            )
+        if self.use_fp8_fmha:
+            self.fp8_dtype = current_platform.fp8_dtype()
+            logger.info_once(
+                "Using dynamic FP8 quantization for FMHA prefill (head_dim=256, gfx950)"
+            )
+
         if attn_type != AttentionType.DECODER:
             raise NotImplementedError(
                 "Only decoder self-attention is supported for "
@@ -920,10 +942,21 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 v_scale,
             )
             return
+        q_descale = k_descale = v_descale = None
+        fwd_q, fwd_k, fwd_v = query, key, value
+        if self.use_fp8_fmha:
+            from vllm.v1.attention.backends._fp8_kv_head_quant import (
+                fp8_per_kv_head_quant,
+            )
+
+            _bs = cu_seqlens_q.numel() - 1
+            fwd_q, q_descale = fp8_per_kv_head_quant(query, self.num_kv_heads, _bs)
+            fwd_k, k_descale = fp8_per_kv_head_quant(key, self.num_kv_heads, _bs)
+            fwd_v, v_descale = fp8_per_kv_head_quant(value, self.num_kv_heads, _bs)
         out, lse = rocm_aiter_ops.flash_attn_varlen_func(
-            q=query,
-            k=key,
-            v=value,
+            q=fwd_q,
+            k=fwd_k,
+            v=fwd_v,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
@@ -936,6 +969,9 @@ class AiterFlashAttentionImpl(AttentionImpl):
             alibi_slopes=self.alibi_slopes,
             return_lse=True,
             sink_ptr=self.sinks,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
         assert attn_metadata.extend_metadata is not None
         chunk_context_metadata = attn_metadata.extend_metadata.chunk_context_metadata
@@ -968,10 +1004,25 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 total_tokens=total_token_per_batch[chunk_idx],
             )
 
+            chunk_q, chunk_k, chunk_v = query, key_fetched, value_fetched
+            cq_ds = ck_ds = cv_ds = None
+            if self.use_fp8_fmha:
+                from vllm.v1.attention.backends._fp8_kv_head_quant import (
+                    fp8_per_kv_head_quant,
+                )
+
+                _bs = cu_seqlens_q.numel() - 1
+                chunk_q, cq_ds = fp8_per_kv_head_quant(query, self.num_kv_heads, _bs)
+                chunk_k, ck_ds = fp8_per_kv_head_quant(
+                    key_fetched, self.num_kv_heads, _bs
+                )
+                chunk_v, cv_ds = fp8_per_kv_head_quant(
+                    value_fetched, self.num_kv_heads, _bs
+                )
             suf_out, suf_lse = rocm_aiter_ops.flash_attn_varlen_func(
-                q=query,
-                k=key_fetched,
-                v=value_fetched,
+                q=chunk_q,
+                k=chunk_k,
+                v=chunk_v,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_kv[chunk_idx],
                 max_seqlen_q=max_seqlen_q,
@@ -984,6 +1035,9 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 alibi_slopes=self.alibi_slopes,
                 return_lse=True,
                 sink_ptr=self.sinks,
+                q_descale=cq_ds,
+                k_descale=ck_ds,
+                v_descale=cv_ds,
             )
             if chunked_output is None:
                 chunked_output = suf_out
@@ -1087,6 +1141,24 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 prefill_key = key[num_decode_tokens + num_extend_tokens :]
                 prefill_value = value[num_decode_tokens + num_extend_tokens :]
 
+                # Dynamic FP8 quantization for hd256 on gfx950
+                q_descale = k_descale = v_descale = None
+                if self.use_fp8_fmha:
+                    from vllm.v1.attention.backends._fp8_kv_head_quant import (
+                        fp8_per_kv_head_quant,
+                    )
+
+                    _bs = attn_metadata.prefill_metadata.query_start_loc.numel() - 1
+                    prefill_query, q_descale = fp8_per_kv_head_quant(
+                        prefill_query, self.num_kv_heads, _bs
+                    )
+                    prefill_key, k_descale = fp8_per_kv_head_quant(
+                        prefill_key, self.num_kv_heads, _bs
+                    )
+                    prefill_value, v_descale = fp8_per_kv_head_quant(
+                        prefill_value, self.num_kv_heads, _bs
+                    )
+
                 rocm_aiter_ops.flash_attn_varlen_func(
                     q=prefill_query,
                     k=prefill_key,
@@ -1103,6 +1175,9 @@ class AiterFlashAttentionImpl(AttentionImpl):
                     alibi_slopes=self.alibi_slopes,
                     out=output_actual_tokens[num_decode_tokens + num_extend_tokens :],
                     sink_ptr=self.sinks,
+                    q_descale=q_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
                 )
 
             # calculate for extends

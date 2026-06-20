@@ -2696,6 +2696,9 @@ class rocm_aiter_ops:
         return_lse: bool = False,
         out: torch.Tensor | None = None,
         sink_ptr: torch.Tensor | None = None,
+        q_descale: torch.Tensor | None = None,
+        k_descale: torch.Tensor | None = None,
+        v_descale: torch.Tensor | None = None,
     ):
         """
         Flash attention with variable length sequences.
@@ -2725,6 +2728,9 @@ class rocm_aiter_ops:
             return_lse=return_lse,
             out=out,
             sink_ptr=sink_ptr,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
 
     @staticmethod
