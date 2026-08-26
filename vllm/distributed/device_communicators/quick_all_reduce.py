@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from enum import Enum
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -88,6 +90,9 @@ class QuickAllReduce:
         are in the same node.
         """
         self.disabled = True
+        self._flydsl_qr: Any | None = None
+        self._flydsl_qr_compiled = False
+        self._flydsl_qr_logged_dispatch = False
         if not self._rocm_arch_available():
             logger.debug(
                 "Custom quick allreduce is only supported on ROCm MI300 series."
@@ -257,6 +262,99 @@ class QuickAllReduce:
             )
         self.create_shared_buffer()
         self.disabled = False
+        try:
+            self._init_flydsl_qr()
+        except Exception:
+            self.close()
+            raise
+
+    def _init_flydsl_qr(self) -> None:
+        vllm_config = get_current_vllm_config_or_none()
+        implementation = os.environ.get(
+            "VLLM_ROCM_QUICK_REDUCE_IMPLEMENTATION",
+            "HIP",
+        ).upper()
+        if implementation not in ("HIP", "FLYDSL"):
+            raise ValueError(
+                "VLLM_ROCM_QUICK_REDUCE_IMPLEMENTATION must be HIP or FLYDSL, "
+                f"got {implementation!r}"
+            )
+        if implementation == "HIP":
+            return
+        if self.qr_quant_level != QuickReduceRegime.INT4:
+            raise ValueError(
+                "FlyDSL QuickReduce only supports "
+                "VLLM_ROCM_QUICK_REDUCE_QUANTIZATION=INT4"
+            )
+
+        from aiter.ops.flydsl.kernels.qr_int4 import QRInt4
+
+        grid_cap = int(
+            os.environ.get(
+                "VLLM_ROCM_FLYDSL_QUICK_REDUCE_GRID_CAP",
+                "1216",
+            )
+        )
+        self._flydsl_qr = QRInt4(
+            group=self.group,
+            device=self.device,
+            rank=self.rank,
+            world_size=self.world_size,
+            super_tile=8,
+            grid_cap=grid_cap,
+        )
+        model_config = None if vllm_config is None else vllm_config.model_config
+        if model_config is not None and model_config.dtype != torch.bfloat16:
+            raise RuntimeError("FlyDSL QRInt4 requires a BF16 vLLM model configuration")
+        warmup_tokens = int(
+            os.environ.get(
+                "VLLM_ROCM_FLYDSL_QUICK_REDUCE_WARMUP_TOKENS",
+                "512",
+            )
+        )
+        if warmup_tokens < 1:
+            raise ValueError(
+                "VLLM_ROCM_FLYDSL_QUICK_REDUCE_WARMUP_TOKENS must be positive"
+            )
+        hidden_size_env = os.environ.get("VLLM_ROCM_FLYDSL_QUICK_REDUCE_HIDDEN_SIZE")
+        if hidden_size_env is not None:
+            hidden_size = int(hidden_size_env)
+        elif model_config is not None:
+            hidden_size = model_config.get_hidden_size()
+        else:
+            raise RuntimeError(
+                "FlyDSL QRInt4 startup warmup requires a model configuration "
+                "or VLLM_ROCM_FLYDSL_QUICK_REDUCE_HIDDEN_SIZE"
+            )
+        if hidden_size < 1:
+            raise ValueError(
+                "VLLM_ROCM_FLYDSL_QUICK_REDUCE_HIDDEN_SIZE must be positive"
+            )
+        warmup_in = torch.zeros(
+            (warmup_tokens, hidden_size),
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        warmup_out = torch.empty_like(warmup_in)
+        from flydsl.expr.typing import Stream
+
+        dist.barrier(group=self.group)
+        self._flydsl_qr.compile(
+            warmup_in,
+            warmup_out,
+            stream=Stream(current_platform.current_stream()),
+        )
+        torch.accelerator.synchronize(self.device)
+        dist.barrier(group=self.group)
+        self._flydsl_qr_compiled = True
+        logger.info(
+            "Using AITER PR #4970 FlyDSL QRInt4 for eligible BF16 INT4 "
+            "all-reduces (world_size=%d, grid_cap=%d, warmup_shape=(%d, %d)).",
+            self.world_size,
+            grid_cap,
+            warmup_tokens,
+            hidden_size,
+        )
 
     @staticmethod
     def _get_qr_min_size(qr_max_size: int | None) -> int | None:
@@ -342,10 +440,43 @@ class QuickAllReduce:
         # as QR uses static IPC buffer.
         if out is None:
             out = torch.empty_like(inp)
+        if self._should_use_flydsl_qr(inp):
+            self._flydsl_all_reduce(inp, out)
+            return out
         ops.qr_all_reduce(
             self._ptr, inp, out, self._get_qr_quant_level(inp), self.use_fp16_kernels
         )
         return out
+
+    def _should_use_flydsl_qr(self, inp: torch.Tensor) -> bool:
+        return (
+            self._flydsl_qr is not None
+            and inp.dtype == torch.bfloat16
+            and self._get_qr_quant_level(inp) == QuickReduceRegime.INT4.value
+        )
+
+    @property
+    def uses_flydsl(self) -> bool:
+        return self._flydsl_qr is not None
+
+    def _flydsl_all_reduce(self, inp: torch.Tensor, out: torch.Tensor) -> None:
+        from flydsl.expr.typing import Stream
+
+        if not self._flydsl_qr_compiled:
+            raise RuntimeError("FlyDSL QRInt4 was not compiled during initialization")
+        flydsl_qr = self._flydsl_qr
+        if flydsl_qr is None:
+            raise RuntimeError("FlyDSL QRInt4 is not initialized")
+        if not self._flydsl_qr_logged_dispatch:
+            logger.info(
+                "Dispatching AITER PR #4970 FlyDSL QRInt4 for input shape=%s "
+                "(%d bytes).",
+                tuple(inp.shape),
+                inp.numel() * inp.element_size(),
+            )
+            self._flydsl_qr_logged_dispatch = True
+        stream = Stream(current_platform.current_stream())
+        flydsl_qr.allreduce(inp, out, stream=stream)
 
     def _get_qr_quant_level(self, inp: torch.Tensor) -> int:
         quantization_min_size = self.qr_quantization_min_size
@@ -357,6 +488,10 @@ class QuickAllReduce:
         return self.qr_quant_level.value
 
     def close(self):
+        flydsl_qr = getattr(self, "_flydsl_qr", None)
+        if flydsl_qr is not None:
+            flydsl_qr.close()
+            self._flydsl_qr = None
         if not self.disabled and getattr(self, "_ptr", None):
             if ops is not None:
                 ops.qr_destroy(self._ptr)

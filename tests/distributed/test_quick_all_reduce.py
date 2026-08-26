@@ -75,6 +75,9 @@ def _make_quick_allreduce_for_test(
 ) -> QuickAllReduce:
     quick_reduce = QuickAllReduce.__new__(QuickAllReduce)
     quick_reduce.disabled = False
+    quick_reduce._flydsl_qr = None
+    quick_reduce._flydsl_qr_compiled = False
+    quick_reduce._flydsl_qr_logged_dispatch = False
     quick_reduce.qr_max_size = 16 * MB
     quick_reduce.qr_min_size = min_size_mb * MB if min_size_mb is not None else None
     quick_reduce.qr_quant_level = QuickReduceRegime.INT4
@@ -82,6 +85,11 @@ def _make_quick_allreduce_for_test(
     quick_reduce.use_fp16_kernels = False
     quick_reduce.world_size = 2
     return quick_reduce
+
+
+class _FakeFlyDSLQR:
+    def close(self):
+        pass
 
 
 def test_should_quick_allreduce_uses_builtin_min_size_when_unset():
@@ -231,6 +239,69 @@ def test_quick_allreduce_passes_dynamic_quant_level(
     quick_reduce.quick_all_reduce(inp)
 
     assert called_quant_level == QuickReduceRegime.FP.value
+
+
+def test_quick_allreduce_dispatches_bf16_int4_to_flydsl(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    quick_reduce = _make_quick_allreduce_for_test()
+    quick_reduce._flydsl_qr = _FakeFlyDSLQR()
+    quick_reduce._ptr = object()
+    inp = torch.empty(8, dtype=torch.bfloat16)
+    calls = []
+
+    monkeypatch.setattr(
+        quick_reduce,
+        "_flydsl_all_reduce",
+        lambda input_, output: calls.append((input_, output)),
+    )
+    monkeypatch.setattr(
+        ops,
+        "qr_all_reduce",
+        lambda *args, **kwargs: pytest.fail("HIP QuickReduce should not run"),
+    )
+
+    out = quick_reduce.quick_all_reduce(inp)
+
+    assert calls == [(inp, out)]
+    quick_reduce.disabled = True
+
+
+@pytest.mark.parametrize(
+    ("dtype", "quantization_min_size"),
+    [
+        (torch.float16, None),
+        (torch.bfloat16, 2 * KB),
+    ],
+)
+def test_quick_allreduce_flydsl_falls_back_to_hip(
+    monkeypatch: pytest.MonkeyPatch,
+    dtype: torch.dtype,
+    quantization_min_size: int | None,
+):
+    quick_reduce = _make_quick_allreduce_for_test(
+        quantization_min_size=quantization_min_size
+    )
+    quick_reduce._flydsl_qr = _FakeFlyDSLQR()
+    quick_reduce._ptr = object()
+    inp = torch.empty(KB // 2, dtype=dtype)
+    calls = []
+
+    monkeypatch.setattr(
+        quick_reduce,
+        "_flydsl_all_reduce",
+        lambda *args: pytest.fail("FlyDSL QuickReduce should not run"),
+    )
+    monkeypatch.setattr(
+        ops,
+        "qr_all_reduce",
+        lambda *args: calls.append(args),
+    )
+
+    quick_reduce.quick_all_reduce(inp)
+
+    assert len(calls) == 1
+    quick_reduce.disabled = True
 
 
 @ray.remote(num_gpus=1, max_calls=1)
