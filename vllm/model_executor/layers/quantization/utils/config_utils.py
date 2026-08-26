@@ -104,7 +104,7 @@ def is_shared_expert_quant_fse_compatible(
         assert "global_quant_config" in quant_config.quant_config
 
         is_compatible = not any(
-            "shared_expert" in str(entry)
+            "shared_expert." in str(entry)
             for entry in quant_config.quant_config["exclude"]
         )
         if not is_compatible:

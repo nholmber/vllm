@@ -574,7 +574,11 @@ def test_models_fse_init(
 
 @pytest.mark.parametrize(
     ("exclude", "expected"),
-    [([], True), (["*.shared_expert.*"], False)],
+    [
+        ([], True),
+        (["*.shared_expert.*"], False),
+        (["model.layers.0.mlp.shared_expert_gate"], True),
+    ],
 )
 def test_quark_shared_expert_fse_compatibility(
     exclude: list[str], expected: bool
