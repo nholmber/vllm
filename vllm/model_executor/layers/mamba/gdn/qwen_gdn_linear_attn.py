@@ -108,7 +108,7 @@ def _resolve_aiter_conv_layout_kwargs(qkvz_layout: str) -> dict[str, str]:
 
 def _resolve_gdn_prefill_backend(
     vllm_config: VllmConfig,
-) -> tuple[str, Literal["triton", "flashinfer", "cutedsl"]]:
+) -> tuple[str, Literal["triton", "flashinfer", "cutedsl", "aiter_flydsl"]]:
     """Resolve GDN prefill backend.
 
     FlashInfer's GDN prefill kernel is chosen when:
@@ -121,6 +121,11 @@ def _resolve_gdn_prefill_backend(
     In-tree CuteDSL GDN prefill kernel is chosen when:
     * "cutedsl" is requested; (opt-in only)
     * Blackwell (SM10.x) with ``head_k_dim == 128``;
+
+    AITER FlyDSL GDN prefill kernels are chosen when:
+    * "aiter_flydsl" is requested; (opt-in only)
+    * ROCm AITER exposes the optimized VK prefill API and FlyDSL kernels;
+    * the model uses BF16 activations with ``head_k_dim == head_v_dim == 128``.
     """
     additional_config = vllm_config.additional_config
     backend_cfg = (
@@ -130,12 +135,27 @@ def _resolve_gdn_prefill_backend(
     )
     backend = str(backend_cfg).strip().lower()
 
-    if not current_platform.is_cuda():
-        return backend, "triton"
-
     head_k_dim = getattr(
         vllm_config.model_config.hf_text_config, "linear_key_head_dim", None
     )
+    head_v_dim = getattr(
+        vllm_config.model_config.hf_text_config, "linear_value_head_dim", None
+    )
+
+    if current_platform.is_rocm():
+        supports_aiter_flydsl = (
+            backend == "aiter_flydsl"
+            and rocm_aiter_ops.is_gdn_flydsl_prefill_available()
+            and head_k_dim == 128
+            and head_v_dim == 128
+            and vllm_config.model_config.dtype == torch.bfloat16
+        )
+        if supports_aiter_flydsl:
+            return backend, "aiter_flydsl"
+        return backend, "triton"
+
+    if not current_platform.is_cuda():
+        return backend, "triton"
 
     supports_flashinfer = False
     supports_cutedsl = False
@@ -169,6 +189,7 @@ def _log_gdn_backend_decision(
     chosen = {
         "flashinfer": "FlashInfer",
         "cutedsl": "CuteDSL",
+        "aiter_flydsl": "AITER FlyDSL",
         "triton": "Triton/FLA",
     }[active_backend]
     logger.info_once(
@@ -233,6 +254,29 @@ def fi_chunk_gated_delta_rule(
         return result.unsqueeze(0), None
 
 
+def _aiter_flydsl_chunk_gated_delta_rule(**kwargs):
+    from aiter.ops.triton.gated_delta_net import chunk_gated_delta_rule_opt_vk
+
+    return chunk_gated_delta_rule_opt_vk(**kwargs)
+
+
+def _prepare_gdn_prefill_initial_state(
+    ssm_state: torch.Tensor,
+    prefill_state_indices: torch.Tensor,
+    prefill_has_initial_state: torch.Tensor,
+    *,
+    use_indexed_state_pool: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if use_indexed_state_pool:
+        fresh_state_indices = prefill_state_indices[~prefill_has_initial_state]
+        ssm_state[fresh_state_indices, ...] = 0
+        return ssm_state, prefill_state_indices
+
+    initial_state = ssm_state[prefill_state_indices]
+    initial_state[~prefill_has_initial_state, ...] = 0
+    return initial_state, None
+
+
 @CustomOp.register("chunk_gated_delta_rule")
 class ChunkGatedDeltaRule(CustomOp):
     def __init__(self) -> None:
@@ -241,7 +285,10 @@ class ChunkGatedDeltaRule(CustomOp):
         backend, active_backend = _resolve_gdn_prefill_backend(vllm_config)
         self.gdn_prefill_backend = active_backend
 
-        if backend in ("flashinfer", "cutedsl") and active_backend != backend:
+        if (
+            backend in ("flashinfer", "cutedsl", "aiter_flydsl")
+            and active_backend != backend
+        ):
             logger.warning_once(
                 "GDN prefill backend '%s' is selected but cannot use this "
                 "kernel on the current platform. Falling back to Triton/FLA.",
@@ -253,6 +300,8 @@ class ChunkGatedDeltaRule(CustomOp):
             self._forward_method = self.forward_cuda
         elif active_backend == "cutedsl":
             self._forward_method = self.forward_cutedsl
+        elif active_backend == "aiter_flydsl":
+            self._forward_method = self.forward_aiter_flydsl
         else:
             self._forward_method = self.forward_native
 
@@ -270,6 +319,8 @@ class ChunkGatedDeltaRule(CustomOp):
         chunk_offsets: torch.Tensor | None = None,
         use_qk_l2norm_in_kernel: bool = True,
         core_attn_out: torch.Tensor | None = None,
+        prefill_metadata: object | None = None,
+        initial_state_indices: torch.Tensor | None = None,
     ):
         o, final_state = fi_chunk_gated_delta_rule(
             q=q,
@@ -302,6 +353,8 @@ class ChunkGatedDeltaRule(CustomOp):
         chunk_offsets: torch.Tensor | None = None,
         use_qk_l2norm_in_kernel: bool = True,
         core_attn_out: torch.Tensor | None = None,
+        prefill_metadata: object | None = None,
+        initial_state_indices: torch.Tensor | None = None,
     ):
         return fla_chunk_gated_delta_rule(
             q=q,
@@ -332,6 +385,8 @@ class ChunkGatedDeltaRule(CustomOp):
         chunk_offsets: torch.Tensor | None = None,
         use_qk_l2norm_in_kernel: bool = True,
         core_attn_out: torch.Tensor | None = None,
+        prefill_metadata: object | None = None,
+        initial_state_indices: torch.Tensor | None = None,
     ):
         from vllm.model_executor.layers.mamba.ops.gdn_chunk_cutedsl import (
             chunk_gated_delta_rule_cutedsl,
@@ -359,6 +414,45 @@ class ChunkGatedDeltaRule(CustomOp):
         )
         if not output_final_state:
             final_state = None
+        return o, final_state
+
+    def forward_aiter_flydsl(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: torch.Tensor,
+        output_final_state: bool,
+        cu_seqlens: torch.Tensor | None = None,
+        chunk_indices: torch.Tensor | None = None,
+        chunk_offsets: torch.Tensor | None = None,
+        use_qk_l2norm_in_kernel: bool = True,
+        core_attn_out: torch.Tensor | None = None,
+        prefill_metadata: object | None = None,
+        initial_state_indices: torch.Tensor | None = None,
+    ):
+        o, final_state = _aiter_flydsl_chunk_gated_delta_rule(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            use_chunk_flydsl=True,
+            use_prepare_flydsl=True,
+            state_dtype=initial_state.dtype,
+            prefill_metadata=prefill_metadata,
+            initial_state_indices=initial_state_indices,
+            inplace_final_state=initial_state_indices is not None,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+        if core_attn_out is not None:
+            o_flat = o.reshape(-1)
+            core_attn_out.reshape(-1)[: o_flat.numel()].copy_(o_flat)
         return o, final_state
 
 
@@ -1137,12 +1231,23 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # CuteDSL kernels require metadata
         chunk_indices = None
         chunk_offsets = None
+        prefill_metadata = None
         if self.gdn_prefill_backend == "cutedsl":
             from vllm.model_executor.layers.mamba.ops.gdn_chunk_cutedsl import (
                 prepare_metadata_cutedsl,
             )
 
             chunk_indices, chunk_offsets = prepare_metadata_cutedsl(cu_seqlens, T)
+        elif self.gdn_prefill_backend == "aiter_flydsl":
+            from aiter.ops.triton.gated_delta_net import (
+                build_gated_delta_rule_prefill_metadata,
+            )
+
+            prefill_metadata = build_gated_delta_rule_prefill_metadata(
+                [T],
+                cu_seqlens=cu_seqlens,
+                chunk_size=FLA_CHUNK_SIZE,
+            )
 
         try:
             self.chunk_gated_delta_rule(
@@ -1157,6 +1262,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 chunk_indices=chunk_indices,
                 chunk_offsets=chunk_offsets,
                 use_qk_l2norm_in_kernel=False,
+                prefill_metadata=prefill_metadata,
             )
         except Exception:
             logger.warning(
@@ -1187,6 +1293,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 cu_seqlens,
                 chunk_indices,
                 chunk_offsets,
+                prefill_metadata,
             )
 
         torch.accelerator.empty_cache()
@@ -1514,8 +1621,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefill_has_initial_state = attn_metadata.prefill_has_initial_state
             assert prefill_state_indices is not None
             assert prefill_has_initial_state is not None
-            initial_state = ssm_state[prefill_state_indices]
-            initial_state[~prefill_has_initial_state, ...] = 0
+            use_indexed_state_pool = self.gdn_prefill_backend == "aiter_flydsl"
+            initial_state, initial_state_indices = _prepare_gdn_prefill_initial_state(
+                ssm_state,
+                prefill_state_indices,
+                prefill_has_initial_state,
+                use_indexed_state_pool=use_indexed_state_pool,
+            )
             (
                 core_attn_out_non_spec,
                 last_recurrent_state,
@@ -1531,9 +1643,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 chunk_indices=attn_metadata.chunk_indices,
                 chunk_offsets=attn_metadata.chunk_offsets,
                 use_qk_l2norm_in_kernel=False,
+                prefill_metadata=attn_metadata.aiter_prefill_metadata,
+                initial_state_indices=initial_state_indices,
             )
-            # Init cache
-            ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
+            if not use_indexed_state_pool:
+                # Init cache. The AITER indexed path writes directly into
+                # ``ssm_state`` and returns that same pool.
+                ssm_state[prefill_state_indices] = last_recurrent_state.to(
+                    ssm_state.dtype
+                )
 
             if split_non_spec:
                 # Stitch the peeled decode outputs in front of the prefill
