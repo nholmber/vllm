@@ -1,14 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from importlib.util import find_spec
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+import vllm.distributed as vllm_distributed
 import vllm.envs as envs
 from tests.compile.backend import TestBackend
 from tests.utils import TestFP8Layer, has_module_attribute, multi_gpu_test
-from vllm._aiter_ops import IS_AITER_FOUND, rocm_aiter_ops
+from vllm._aiter_ops import (
+    IS_AITER_FOUND,
+    _rocm_aiter_fused_allreduce_rmsnorm_impl,
+    rocm_aiter_ops,
+)
 from vllm._custom_ops import cutlass_scaled_fp4_mm, scaled_fp4_quant
 from vllm.compilation.passes.fusion.allreduce_rms_fusion import (
     AllReduceFusionPass,
@@ -79,6 +85,73 @@ def test_select_flashinfer_allreduce_use_oneshot(
     )
 
 
+@pytest.mark.parametrize(
+    ("num_tokens", "expected_use_1stage"),
+    [(80, True), (81, False)],
+    ids=["one-stage", "two-stage"],
+)
+def test_rocm_aiter_fused_allreduce_gemma_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    num_tokens: int,
+    expected_use_1stage: bool,
+):
+    input_ = torch.randn(num_tokens, 16, dtype=torch.bfloat16, device="cpu")
+    residual = torch.randn_like(input_)
+    raw_weight = torch.randn(16, dtype=torch.bfloat16, device="cpu")
+    expected = (torch.empty_like(input_), torch.empty_like(residual))
+    recorded_call = None
+
+    class FakeCustomAllreduce:
+        world_size = 2
+        fully_connected = True
+
+        def custom_fused_ar_rms(self, *args, **kwargs):
+            nonlocal recorded_call
+            recorded_call = (args, kwargs)
+            return expected
+
+    aiter_ar = SimpleNamespace(aiter_ca=FakeCustomAllreduce())
+    monkeypatch.setattr(
+        rocm_aiter_ops,
+        "get_aiter_allreduce",
+        lambda: aiter_ar,
+    )
+
+    def fail_if_quickreduce_is_considered(*args, **kwargs):
+        raise AssertionError("Gemma RMSNorm must stay on AITER custom allreduce")
+
+    qr_comm = SimpleNamespace(
+        disabled=False,
+        uses_flydsl=True,
+        should_quick_allreduce=fail_if_quickreduce_is_considered,
+    )
+    monkeypatch.setattr(
+        vllm_distributed,
+        "get_tp_group",
+        lambda: SimpleNamespace(device_communicator=SimpleNamespace(qr_comm=qr_comm)),
+    )
+
+    actual = _rocm_aiter_fused_allreduce_rmsnorm_impl(
+        input_,
+        residual,
+        raw_weight,
+        1e-6,
+        gemma_norm=True,
+    )
+
+    assert actual[0] is expected[0]
+    assert actual[1] is expected[1]
+    assert recorded_call is not None
+    args, kwargs = recorded_call
+    assert args[0] is input_
+    assert args[1] is residual
+    assert args[2] is raw_weight
+    assert kwargs == {
+        "use_1stage": expected_use_1stage,
+        "gemma_norm": True,
+    }
+
+
 class TestAllReduceRMSNormModel(torch.nn.Module):
     def __init__(
         self,
@@ -133,10 +206,12 @@ class TestAllReduceGemmaRMSNormModel(torch.nn.Module):
         token_num=16,
         eps=1e-6,
         dtype: torch.dtype = torch.float16,
+        use_aiter: bool = False,
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.eps = eps
+        self.use_aiter = use_aiter
         self.norm = [GemmaRMSNorm(hidden_size, eps) for _ in range(4)]
         # Non-trivial weight (~Gemma range) so (1 + w) exercises the scale path.
         for n in self.norm:
@@ -166,6 +241,8 @@ class TestAllReduceGemmaRMSNormModel(torch.nn.Module):
         return [torch.ops.vllm.all_reduce.default]
 
     def ops_in_model_after(self):
+        if self.use_aiter:
+            return [rocm_aiter_ops.get_fused_allreduce_rmsnorm_op()]
         return [torch.ops.vllm.flashinfer_trtllm_fused_allreduce_norm.default]
 
 
@@ -602,7 +679,10 @@ def all_reduce_fusion_pass_on_test_model(
         )
 
         token_num = batch_size * seq_len
-        if test_model_cls is TestAllReduceRMSNormModel:
+        if test_model_cls in (
+            TestAllReduceRMSNormModel,
+            TestAllReduceGemmaRMSNormModel,
+        ):
             model = test_model_cls(
                 hidden_size, token_num, dtype=dtype, use_aiter=use_aiter
             )
@@ -616,14 +696,29 @@ def all_reduce_fusion_pass_on_test_model(
 
         results_unfused = model(hidden_states)
         results_fused = compiled_model(hidden_states)
-        torch.testing.assert_close(results_unfused, results_fused, atol=1e-2, rtol=1e-2)
+        tolerance = (
+            5e-2
+            if use_aiter and test_model_cls is TestAllReduceGemmaRMSNormModel
+            else 1e-2
+        )
+        torch.testing.assert_close(
+            results_unfused,
+            results_fused,
+            atol=tolerance,
+            rtol=tolerance,
+        )
 
         assert all_reduce_fusion_pass.matched_count == 4, (
             f"{all_reduce_fusion_pass.matched_count=}"
         )
         backend.check_before_ops(model.ops_in_model_before(), fully_replaced=False)
         backend.check_after_ops(model.ops_in_model_after())
-        if test_model_cls in (
+        if use_aiter and test_model_cls is TestAllReduceGemmaRMSNormModel:
+            fused_op = rocm_aiter_ops.get_fused_allreduce_rmsnorm_op()
+            fused_nodes = list(find_op_nodes(fused_op, backend.graph_post_pass))
+            assert fused_nodes
+            assert all(n.kwargs.get("gemma_norm") is True for n in fused_nodes)
+        elif test_model_cls in (
             TestAllReduceGemmaRMSNormModel,
             TestAllReduceGemmaRMSNormStaticQuantFP8Model,
         ):
@@ -632,6 +727,47 @@ def all_reduce_fusion_pass_on_test_model(
             assert fused_nodes
             assert all(n.kwargs.get("weight_bias") == 1.0 for n in fused_nodes)
         del all_reduce_fusion_pass
+
+
+@multi_gpu_test(num_gpus=2)
+@pytest.mark.parametrize(
+    "token_num",
+    [64, 81],
+    ids=["one-stage", "two-stage"],
+)
+@pytest.mark.skipif(
+    not current_platform.is_rocm(),
+    reason="ROCm AITER Gemma AR+RMS fusion is ROCm-only",
+)
+@pytest.mark.skipif(not IS_AITER_FOUND, reason="aiter is not found")
+def test_rocm_aiter_all_reduce_gemma_rmsnorm_fusion_pass_replace(
+    token_num: int,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    with monkeypatch.context() as m:
+        m.setenv("VLLM_ROCM_USE_AITER", "1")
+        rocm_aiter_ops.refresh_env_variables()
+
+    num_processes = 2
+    master_port = get_open_port()
+    torch.multiprocessing.spawn(
+        all_reduce_fusion_pass_on_test_model,
+        args=(
+            num_processes,
+            master_port,
+            TestAllReduceGemmaRMSNormModel,
+            1,
+            token_num,
+            64,
+            torch.bfloat16,
+            True,
+            False,
+            "trtllm",
+            True,
+            monkeypatch,
+        ),
+        nprocs=num_processes,
+    )
 
 
 @multi_gpu_test(num_gpus=2)

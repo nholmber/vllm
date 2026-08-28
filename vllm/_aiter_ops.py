@@ -953,6 +953,7 @@ def _rocm_aiter_fused_allreduce_rmsnorm_impl(
     residual: torch.Tensor,
     weight: torch.Tensor,
     epsilon: float,
+    gemma_norm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     aiter_ar = rocm_aiter_ops.get_aiter_allreduce()
     assert aiter_ar is not None, "aiter allreduce must be initialized"
@@ -989,7 +990,10 @@ def _rocm_aiter_fused_allreduce_rmsnorm_impl(
     # hidden_ok exactly, so this path is reached only when token_ok (<=80
     # tokens) or size_ok fails, i.e. at larger batches. Confirm in a trace
     # rather than assuming -- Qwen3.5 (hidden 4096) behaves differently.
-    if not use_1stage:
+    # QuickReduce RMSNorm does not accept raw Gemma weights yet. Keep Gemma
+    # normalization on AITER custom allreduce, whose one- and two-stage kernels
+    # both support gemma_norm.
+    if not use_1stage and not gemma_norm:
         from vllm.distributed import get_tp_group
 
         device_comm = get_tp_group().device_communicator
@@ -1063,6 +1067,7 @@ def _rocm_aiter_fused_allreduce_rmsnorm_impl(
         weight,
         epsilon,
         use_1stage=use_1stage,
+        gemma_norm=gemma_norm,
     )
     assert result is not None
     return result[0], result[1]
@@ -1073,6 +1078,7 @@ def _rocm_aiter_fused_allreduce_rmsnorm_fake(
     residual: torch.Tensor,
     weight: torch.Tensor,
     epsilon: float,
+    gemma_norm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.empty_like(input_), torch.empty_like(residual)
 
