@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3-Next/Qwen3.5 model."""
 
+import inspect
 import os
 from typing import Literal
 
@@ -87,6 +88,26 @@ if GDN_AITER_TRITON_AVAILABLE:
     from aiter.ops.triton.gated_delta_net.fused_rearrange_sigmoid_gdr import (
         fused_rearrange_sigmoid_gated_delta_rule as gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule,  # noqa: E501
     )
+
+
+def _gdn_aiter_supports_fused_gdr_rmsnorm_silu() -> bool:
+    """Whether AITER's fused GDR wrapper exposes the Qwen norm epilogue."""
+    if not GDN_AITER_TRITON_AVAILABLE:
+        return False
+    try:
+        parameters = inspect.signature(
+            gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule
+        ).parameters
+    except (NameError, TypeError, ValueError):
+        return False
+    return {
+        "output_gate",
+        "norm_weight",
+        "norm_eps",
+    }.issubset(parameters)
+
+
+GDN_AITER_SUPPORTS_FUSED_GDR_RMSNORM_SILU = _gdn_aiter_supports_fused_gdr_rmsnorm_silu()
 
 logger = init_logger(__name__)
 
@@ -586,6 +607,20 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             activation=output_gate_type,
             device=current_platform.current_device(),
         )
+        _, recurrent_state_dtype = self.get_state_dtype()
+        self.enable_aiter_fused_gdr_norm = (
+            GDN_AITER_SUPPORTS_FUSED_GDR_RMSNORM_SILU
+            and (self.gqa_interleaved_layout or GDN_AITER_SUPPORTS_QKVZ_LAYOUT)
+            and self.num_k_heads // self.tp_size == 2
+            and self.num_v_heads // self.tp_size == 16
+            and self.head_k_dim == 128
+            and self.head_v_dim == 128
+            and self.model_config.dtype == torch.bfloat16
+            and recurrent_state_dtype in FUSED_GDN_STATE_DTYPES
+            and self.norm.group_size is None
+            and self.norm.norm_before_gate
+            and self.norm.activation == "silu"
+        )
 
         self.out_proj = RowParallelLinear(
             self.value_dim,
@@ -980,6 +1015,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 dtype=projected_states_qkvz.dtype,
                 device=projected_states_qkvz.device,
             )
+            fuse_gdr_norm = (
+                self.enable_aiter_fused_gdr_norm
+                and hidden_states.dtype == torch.bfloat16
+                and self.norm.weight.dtype in (torch.bfloat16, torch.float32)
+            )
 
             torch.ops.vllm.qwen_gdn_attention_core(
                 projected_states_qkvz,
@@ -988,8 +1028,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 core_attn_out,
                 layer_name=_encode_layer_name(self.prefix),
                 use_aiter=True,
+                fuse_norm=fuse_gdr_norm,
             )
 
+            if fuse_gdr_norm:
+                output, _ = self.out_proj(core_attn_out.flatten(-2))
+                return output
             return self._output_projection(core_attn_out, z)
         else:
             return self.forward_cuda(hidden_states)
@@ -1304,6 +1348,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         ba: torch.Tensor,
         z_out: torch.Tensor,
         core_attn_out: torch.Tensor,
+        fuse_norm: bool = False,
     ):
         """ROCm AITER fast path: conv1d + recurrent attention from packed
         qkvz/ba layout.
@@ -1348,6 +1393,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 z_out=z_out,
                 core_attn_out=core_attn_out,
                 attn_metadata=attn_metadata,
+                fuse_norm=fuse_norm,
             )
 
         core_attn_out.zero_()
@@ -1362,6 +1408,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             a=a,
             core_attn_out=core_attn_out,
         )
+        if fuse_norm:
+            core_attn_out.copy_(
+                self.norm.forward_native(
+                    core_attn_out,
+                    z_out,
+                )
+            )
 
     def _forward_core(
         self,
@@ -1697,6 +1750,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         z_out: torch.Tensor,
         core_attn_out: torch.Tensor,
         attn_metadata: GDNAttentionMetadata,
+        fuse_norm: bool = False,
     ):
         non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
         non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
@@ -1739,7 +1793,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
 
         # 2. Recurrent attention
-        gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule(
+        gdr_kwargs = dict(
             A_log=self.A_log,
             a=a,
             b=b,
@@ -1756,6 +1810,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             use_qk_l2norm_in_kernel=True,
             core_attn_out=core_attn_out.reshape(-1),
         )
+        if fuse_norm:
+            gdr_kwargs.update(
+                output_gate=z_out[: attn_metadata.num_actual_tokens],
+                norm_weight=self.norm.weight.contiguous(),
+                norm_eps=self.norm.eps,
+            )
+        gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule(**gdr_kwargs)
 
     def _forward_core_decode_non_spec(
         self,
@@ -2027,6 +2088,7 @@ def qwen_gdn_attention_core(
     core_attn_out: torch.Tensor,
     layer_name: LayerNameType,
     use_aiter: bool = False,
+    fuse_norm: bool = False,
 ) -> None:
     """Custom op dispatching to _forward_core or _forward_core_rocm.
 
@@ -2040,6 +2102,7 @@ def qwen_gdn_attention_core(
         z output buffer (mutated in-place).
 
     ``core_attn_out`` is always mutated in-place.
+    If ``fuse_norm=True``, it contains RMSNorm(output) * SiLU(z) on return.
     """
     layer_name = _resolve_layer_name(layer_name)
     forward_context: ForwardContext = get_forward_context()
@@ -2050,6 +2113,7 @@ def qwen_gdn_attention_core(
             ba=b_or_ba,
             z_out=a_or_z_out,
             core_attn_out=core_attn_out,
+            fuse_norm=fuse_norm,
         )
     else:
         self._forward_core(
@@ -2067,6 +2131,7 @@ def gdn_attention_core_fake(
     core_attn_out: torch.Tensor,
     layer_name: LayerNameType,
     use_aiter: bool = False,
+    fuse_norm: bool = False,
 ) -> None:
     """Fake implementation for torch.compile."""
     return
