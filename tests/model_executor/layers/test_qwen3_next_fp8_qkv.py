@@ -203,6 +203,7 @@ def test_qwen3_next_fp8_prep_pure_decode_uses_bf16_fallback(monkeypatch):
     expected_key = torch.randn(4, NUM_KV_HEADS * HEAD_DIM)
     expected_gate = torch.randn_like(expected_query)
     recorded_weights = None
+    recorded_kwargs = None
 
     def fake_bf16_prep(
         q_gate,
@@ -212,8 +213,9 @@ def test_qwen3_next_fp8_prep_pure_decode_uses_bf16_fallback(monkeypatch):
         *args,
         **kwargs,
     ):
-        nonlocal recorded_weights
+        nonlocal recorded_kwargs, recorded_weights
         recorded_weights = (query_norm_weight, key_norm_weight)
+        recorded_kwargs = kwargs
         return expected_query, expected_key, expected_gate
 
     monkeypatch.setattr(
@@ -249,8 +251,9 @@ def test_qwen3_next_fp8_prep_pure_decode_uses_bf16_fallback(monkeypatch):
     assert outputs[1] is expected_key
     assert outputs[2] is expected_gate
     assert recorded_weights is not None
-    torch.testing.assert_close(recorded_weights[0], inputs[3].float() + 1.0)
-    torch.testing.assert_close(recorded_weights[1], inputs[4].float() + 1.0)
+    assert recorded_weights[0] is inputs[3]
+    assert recorded_weights[1] is inputs[4]
+    assert recorded_kwargs == {"gemma_norm": True}
     assert outputs[3].shape == (4, NUM_QUERY_HEADS, HEAD_DIM)
     assert outputs[4].shape == (4, NUM_KV_HEADS, HEAD_DIM)
     assert outputs[6].shape == (256, NUM_KV_HEADS)
@@ -317,3 +320,64 @@ def test_qwen3_next_model_builds_prequantized_bundle(monkeypatch):
     assert prequantized_qkv.query is expected_outputs[3]
     assert prequantized_qkv.key is expected_outputs[4]
     assert prequantized_qkv.value is expected_outputs[5]
+
+
+def test_qwen3_next_model_fused_qk_prep_uses_raw_gemma_weights(monkeypatch):
+    inputs = _make_inputs()
+    expected_query, expected_key, expected_gate = _make_outputs(inputs)[:3]
+    attention = object.__new__(qwen3_next_model.Qwen3NextAttention)
+    torch.nn.Module.__init__(attention)
+    attention.use_prequantized_qkv = False
+    attention.use_fused_qk_norm_rope_gate = True
+    attention.q_size = NUM_QUERY_HEADS * HEAD_DIM
+    attention.kv_size = NUM_KV_HEADS * HEAD_DIM
+    attention.num_heads = NUM_QUERY_HEADS
+    attention.num_kv_heads = NUM_KV_HEADS
+    attention.head_dim = HEAD_DIM
+    attention.attn_output_gate = True
+    attention.q_norm = SimpleNamespace(
+        weight=inputs[3],
+        variance_epsilon=1.0e-6,
+    )
+    attention.k_norm = SimpleNamespace(weight=inputs[4])
+    attention.rotary_emb = SimpleNamespace(
+        cos_sin_cache=inputs[5],
+        rotary_dim=ROTARY_DIM,
+    )
+    recorded_weights = None
+    recorded_kwargs = None
+
+    def fake_fused_qk_prep(
+        q_gate,
+        key,
+        query_norm_weight,
+        key_norm_weight,
+        *args,
+        **kwargs,
+    ):
+        nonlocal recorded_kwargs, recorded_weights
+        recorded_weights = (query_norm_weight, key_norm_weight)
+        recorded_kwargs = kwargs
+        return expected_query, expected_key, expected_gate
+
+    monkeypatch.setattr(
+        qwen3_next_model,
+        "fused_qk_rmsnorm_rope_gate",
+        fake_fused_qk_prep,
+    )
+
+    qkv = torch.cat((inputs[0], inputs[1], inputs[2]), dim=-1)
+    query, key, value, gate, prequantized_qkv = attention._project_qkv_gate(
+        qkv,
+        inputs[6],
+    )
+
+    assert query is expected_query
+    assert key is expected_key
+    torch.testing.assert_close(value, inputs[2])
+    assert gate is expected_gate
+    assert prequantized_qkv is None
+    assert recorded_weights is not None
+    assert recorded_weights[0] is inputs[3]
+    assert recorded_weights[1] is inputs[4]
+    assert recorded_kwargs == {"gemma_norm": True}

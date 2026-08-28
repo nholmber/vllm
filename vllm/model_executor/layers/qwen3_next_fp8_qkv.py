@@ -125,8 +125,8 @@ def _qwen3_next_fp8_qkv_prep_impl(
         query, output_key, gate = fused_qk_rmsnorm_rope_gate(
             q_gate,
             key,
-            query_norm_weight.float() + 1.0,
-            key_norm_weight.float() + 1.0,
+            query_norm_weight,
+            key_norm_weight,
             cos_sin_cache,
             positions,
             eps,
@@ -134,6 +134,7 @@ def _qwen3_next_fp8_qkv_prep_impl(
             num_kv_heads,
             head_dim,
             rotary_dim,
+            gemma_norm=True,
         )
         return (
             query,

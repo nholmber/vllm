@@ -36,12 +36,13 @@ def _ref_qk_rmsnorm_rope_gate(
     num_kv_heads: int,
     head_dim: int,
     rotary_dim: int,
+    gemma_norm: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """PyTorch reference: split + RMSNorm + partial NeoX RoPE + gate extraction.
 
     Matches ``fused_qk_rmsnorm_rope_gate``'s contract: ``q_gamma`` / ``k_gamma``
-    are the already-adjusted effective gammas (for GemmaRMSNorm the caller
-    has done ``weight + 1`` before passing them in).
+    are raw GemmaRMSNorm weights when ``gemma_norm`` is true and effective
+    gammas otherwise.
     """
     n_tokens = q_gate.shape[0]
     half = rotary_dim // 2
@@ -57,6 +58,8 @@ def _ref_qk_rmsnorm_rope_gate(
         x = x.float()
         var = x.pow(2).mean(dim=-1, keepdim=True)
         x = x * torch.rsqrt(var + eps)
+        if gemma_norm:
+            gamma = gamma.float() + 1.0
         return (x * gamma.float()).to(orig_dtype)
 
     q = rms_norm(q, q_gamma)
@@ -89,12 +92,14 @@ def _ref_qk_rmsnorm_rope_gate(
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS)
+@pytest.mark.parametrize("gemma_norm", [False, True])
 @torch.inference_mode()
 def test_fused_qk_norm_rope_gate_matches_reference(
     default_vllm_config,
     dtype: torch.dtype,
     seed: int,
     num_tokens: int,
+    gemma_norm: bool,
 ):
     device = torch.device("cuda", torch.accelerator.current_device_index())
     torch.set_default_device(device)
@@ -104,14 +109,11 @@ def test_fused_qk_norm_rope_gate_matches_reference(
         num_tokens, NUM_Q_HEADS * 2 * HEAD_DIM, dtype=dtype, device=device
     )
     k = torch.randn(num_tokens, NUM_KV_HEADS * HEAD_DIM, dtype=dtype, device=device)
-    # GemmaRMSNorm-style: the kernel takes the effective gamma (weight + 1).
-    q_gamma = (
-        torch.empty(HEAD_DIM, dtype=dtype, device=device).normal_(mean=0.0, std=0.1)
-        + 1.0
+    q_gamma = torch.empty(HEAD_DIM, dtype=dtype, device=device).normal_(
+        mean=0.0 if gemma_norm else 1.0, std=0.1
     )
-    k_gamma = (
-        torch.empty(HEAD_DIM, dtype=dtype, device=device).normal_(mean=0.0, std=0.1)
-        + 1.0
+    k_gamma = torch.empty(HEAD_DIM, dtype=dtype, device=device).normal_(
+        mean=0.0 if gemma_norm else 1.0, std=0.1
     )
 
     # fused_qk_rmsnorm_rope_gate only handles NeoX-style RoPE.
@@ -137,7 +139,9 @@ def test_fused_qk_norm_rope_gate_matches_reference(
         NUM_KV_HEADS,
         HEAD_DIM,
         ROTARY_DIM,
+        gemma_norm,
     )
+    fused_kwargs = {"gemma_norm": True} if gemma_norm else {}
     q_out, k_out, gate_out = fused_qk_rmsnorm_rope_gate(
         q_gate,
         k,
@@ -150,6 +154,7 @@ def test_fused_qk_norm_rope_gate_matches_reference(
         NUM_KV_HEADS,
         HEAD_DIM,
         ROTARY_DIM,
+        **fused_kwargs,
     )
 
     atol, rtol = 2e-3, 5e-3

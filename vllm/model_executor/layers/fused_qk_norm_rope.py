@@ -36,6 +36,7 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     rotary_dim: tl.constexpr,
     half_rotary: tl.constexpr,
     eps: tl.constexpr,
+    WEIGHT_BIAS: tl.constexpr,
     INPUT_DTYPE: tl.constexpr,
     HEAD_BLOCK: tl.constexpr,
     ROT_HALF_BLOCK: tl.constexpr,
@@ -61,7 +62,10 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     x = tl.load(in_base + head_offs, mask=head_mask, other=0.0).to(tl.float32)
     var = tl.sum(x * x, axis=0) / head_dim
     inv_rms = tl.rsqrt(var + eps)
-    w = tl.load(w_ptr + head_offs, mask=head_mask, other=0.0).to(tl.float32)
+    w = (
+        tl.load(w_ptr + head_offs, mask=head_mask, other=0.0).to(tl.float32)
+        + WEIGHT_BIAS
+    )
     # Round-trip through INPUT_DTYPE so the RoPE input matches the bf16-storage
     # behavior of the unfused (qk_rmsnorm -> memory -> apply_rope) reference path.
     x_norm = (x * inv_rms * w).to(INPUT_DTYPE).to(tl.float32)
@@ -82,9 +86,12 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     x_rot2 = tl.load(in_base + half_rotary + rot_offs, mask=rot_mask, other=0.0).to(
         tl.float32
     )
-    w_rot1 = tl.load(w_ptr + rot_offs, mask=rot_mask, other=0.0).to(tl.float32)
-    w_rot2 = tl.load(w_ptr + half_rotary + rot_offs, mask=rot_mask, other=0.0).to(
-        tl.float32
+    w_rot1 = (
+        tl.load(w_ptr + rot_offs, mask=rot_mask, other=0.0).to(tl.float32) + WEIGHT_BIAS
+    )
+    w_rot2 = (
+        tl.load(w_ptr + half_rotary + rot_offs, mask=rot_mask, other=0.0).to(tl.float32)
+        + WEIGHT_BIAS
     )
     x_rot1 = (x_rot1 * inv_rms * w_rot1).to(INPUT_DTYPE).to(tl.float32)
     x_rot2 = (x_rot2 * inv_rms * w_rot2).to(INPUT_DTYPE).to(tl.float32)
@@ -126,14 +133,18 @@ def fused_qk_rmsnorm_rope_gate(
     num_kv_heads: int,
     head_dim: int,
     rotary_dim: int,
+    gemma_norm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused split + QK-RMSNorm + (partial) RoPE + gate copy for Qwen3.5 attn.
 
     Args:
         q_gate: (n_tokens, num_q_heads * 2 * head_dim) -- per head: [q|gate]
         k: (n_tokens, num_kv_heads * head_dim)
-        q_weight: (head_dim,) GemmaRMSNorm effective weight (already +1)
-        k_weight: (head_dim,) GemmaRMSNorm effective weight (already +1)
+        q_weight: (head_dim,) RMSNorm weight. When ``gemma_norm`` is true,
+            this is the raw GemmaRMSNorm weight; otherwise it is the effective
+            gamma used directly by RMSNorm.
+        k_weight: (head_dim,) RMSNorm weight, with the same convention as
+            ``q_weight``.
         cos_sin_cache: (max_pos, rotary_dim) packed [cos|sin]
         positions: (n_tokens,) int32 or int64
         eps: RMSNorm epsilon
@@ -141,6 +152,7 @@ def fused_qk_rmsnorm_rope_gate(
         num_kv_heads: number of KV heads (after TP split)
         head_dim: per-head dimension
         rotary_dim: rotary dimension; must be even and <= head_dim
+        gemma_norm: add 1.0 to the weights inside the fused kernel
 
     Returns:
         (q_out, k_out, gate_out) -- all contiguous (n_tokens, heads * head_dim).
@@ -191,6 +203,7 @@ def fused_qk_rmsnorm_rope_gate(
         rotary_dim,
         half_rotary,
         eps,
+        WEIGHT_BIAS=1.0 if gemma_norm else 0.0,
         INPUT_DTYPE=tl.bfloat16 if q_gate.dtype == torch.bfloat16 else tl.float16,
         HEAD_BLOCK=head_block,
         ROT_HALF_BLOCK=rot_half_block,
